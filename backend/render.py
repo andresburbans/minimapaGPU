@@ -10,9 +10,10 @@ from typing import Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import rasterio
+from rasterio import Affine
 from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
-from rasterio.warp import transform_bounds
+from rasterio.warp import transform_bounds, reproject
 from shapely.errors import GEOSException
 from shapely.geometry import LineString, Point, Polygon, box
 from PIL import Image, ImageDraw
@@ -343,6 +344,69 @@ def render_frame(
     rgb_raw, alpha_raw = _to_rgba(data, nodata_val=dataset.nodata)
     rgba = _normalize_rgba(rgb_raw, alpha_raw)
     base = Image.fromarray(rgba, mode="RGBA")
+
+    # --- WMS Background Overlay (CPU) ---
+    try:
+        # 1. Calculate geographic bounds of current view
+        w_geo, s_geo, e_geo, n_geo = transform_bounds(dataset.crs, "EPSG:4326", xmin, ymin, xmax, ymax, densify_pts=21)
+        
+        # 2. Smart Zoom Selection (Adaptive)
+        span_deg = max(e_geo - w_geo, n_geo - s_geo)
+        if span_deg > 0:
+            # We want roughly 1:1 or better pixel density for WMS vs Output
+            # Buffer is ss_render_size_px
+            ideal_z = math.log2((ss_render_size_px * 360) / (256 * span_deg))
+            zoom = min(19, max(10, int(ideal_z + 0.5)))
+        else:
+            zoom = 18
+            
+        print(f"[WMS] CPU Mode Adaptive Zoom: {zoom} (Span: {span_deg:.6f} deg)")
+        mosaic, (m_l, m_t) = _fetch_wms_mosaic_for_bounds(w_geo, s_geo, e_geo, n_geo, zoom)
+        
+        if mosaic:
+            # 3. Create Source Transform (EPSG:3857 - Web Mercator)
+            # Web Mercator resolution at zoom 19
+            res_3857 = 40075016.686 / (256 * (2 ** zoom))
+            # World coordinates in meters for the top-left of the mosaic
+            wms_m_l = -20037508.34 + m_l * res_3857
+            wms_m_t = 20037508.34 - m_t * res_3857
+            src_transform = Affine(res_3857, 0, wms_m_l, 0, -res_3857, wms_m_t)
+            
+            # 4. Create Destination Transform (dataset.crs - e.g. UTM)
+            # We are reprojecting to the square grid defined by [xmin, xmax] x [ymin, ymax]
+            # with resolution matching our supersampled buffer
+            dst_res = (xmax - xmin) / ss_render_size_px
+            dst_transform = Affine(dst_res, 0, xmin, 0, -dst_res, ymax)
+            
+            # 5. Prepare data for reprojection
+            src_arr = np.array(mosaic) # (H, W, 3)
+            src_arr = np.moveaxis(src_arr, -1, 0) # (3, H, W)
+            
+            # Target buffer for WMS
+            wms_final_arr = np.zeros((3, ss_render_size_px, ss_render_size_px), dtype=np.uint8)
+            
+            # 6. Reproject WMS from EPSG:3857 to dataset.crs
+            reproject(
+                src_arr,
+                wms_final_arr,
+                src_transform=src_transform,
+                src_crs="EPSG:3857",
+                dst_transform=dst_transform,
+                dst_crs=dataset.crs,
+                resampling=Resampling.bilinear
+            )
+            
+            # 7. Quality composite
+            wms_img = Image.fromarray(np.moveaxis(wms_final_arr, 0, -1)).convert("RGBA")
+            # Composite Ortho (base) OVER WMS (wms_img)
+            # Ortho transparency is handled by alpha_composite if base is RGBA
+            wms_img.alpha_composite(base)
+            base = wms_img
+            
+    except Exception as ex:
+        print(f"[WMS] CPU Background Alignment Error: {ex}")
+        # Continue with just the ortho if WMS fails
+        pass
 
     # 7. Use supersampled mapping for vector drawing
     draw = ImageDraw.Draw(base, "RGBA")
@@ -965,7 +1029,7 @@ _GLOBAL_DATASET = None
 _GLOBAL_VECTORS = None
 _GLOBAL_SETTINGS = None
 
-_ROTATION_OVERSCAN = 1.45
+_ROTATION_OVERSCAN = 1.5
 
 
 def init_worker(
@@ -1061,64 +1125,10 @@ def render_frame_job(job: Tuple[int, float, float, float, str]) -> int:
         center_n + clip_margin,
     )
     
-    # === 1. Render WMS Base ===
-    try:
-        w_geo, s_geo, e_geo, n_geo = transform_bounds(
-            _GLOBAL_DATASET.crs, 
-            "EPSG:4326", 
-            bbox[0], bbox[1], bbox[2], bbox[3], 
-            densify_pts=21
-        )
-        zoom = 19
-        
-        mosaic_img, (mosaic_left_glob, mosaic_top_glob) = _fetch_wms_mosaic_for_bounds(w_geo, s_geo, e_geo, n_geo, zoom)
-        
-        # Calculate center relative to mosaic
-        center_lon_geo = (w_geo + e_geo) / 2
-        center_lat_geo = (s_geo + n_geo) / 2
-        cx_glob, cy_glob = _latlon_to_pixel(center_lat_geo, center_lon_geo, zoom)
-        
-        rel_cx = cx_glob - mosaic_left_glob
-        rel_cy = cy_glob - mosaic_top_glob
-        
-        # === CRITICAL: Use render_size_px for crop, same as ortho ===
-        # This ensures both layers have identical pre-rotation geometry
-        crop_size = render_size_px
-        crop_l = int(rel_cx - crop_size / 2)
-        crop_t = int(rel_cy - crop_size / 2)
-        crop_r = crop_l + crop_size
-        crop_b = crop_t + crop_size
-        
-        # Handle edge cases where mosaic might be smaller
-        ms_w, ms_h = mosaic_img.size
-        
-        # Create a properly sized crop with padding if needed
-        wms_crop = Image.new("RGB", (crop_size, crop_size), (20, 20, 20))
-        
-        # Calculate source and destination regions
-        src_l = max(0, crop_l)
-        src_t = max(0, crop_t)
-        src_r = min(ms_w, crop_r)
-        src_b = min(ms_h, crop_b)
-        
-        dst_l = max(0, -crop_l)
-        dst_t = max(0, -crop_t)
-        
-        if src_r > src_l and src_b > src_t:
-            region = mosaic_img.crop((src_l, src_t, src_r, src_b))
-            wms_crop.paste(region, (dst_l, dst_t))
-        
-        # Rotate WMS using the SAME function and target_size as ortho
-        wms_rotated = _rotate_image(wms_crop, heading if heading else 0, (width, height))
-        base_frame = wms_rotated.convert("RGBA")
-        
-    except Exception as e:
-        print(f"WMS Fail: {e}")
-        base_frame = Image.new("RGBA", (width, height), (20, 20, 20, 255))
-
+    # Clip vectors for the current frame
     clipped = clip_vectors(_GLOBAL_VECTORS, bbox)
     
-    # Render ortho layer (uses same geometry internally)
+    # Render frame (WMS is now handled internally in render_frame for perfect alignment)
     frame = render_frame(
         _GLOBAL_DATASET,
         clipped,
@@ -1141,11 +1151,7 @@ def render_frame_job(job: Tuple[int, float, float, float, str]) -> int:
     if frame.mode != "RGBA":
         frame = frame.convert("RGBA")
     
-    if base_frame.size != (width, height):
-        base_frame = base_frame.resize((width, height), Image.LANCZOS)
-
-    # Composite: ortho over WMS
-    final_image = Image.alpha_composite(base_frame, frame)
-    final_image.save(frame_path, "PNG")
+    # Save the frame
+    frame.save(frame_path, "PNG")
     return 1
 

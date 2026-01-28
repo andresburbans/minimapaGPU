@@ -377,8 +377,8 @@ export default function Home() {
 
   // ========== RENDER SETTINGS (MINIMAP) ==========
   const [fps, setFps] = useState(30);
-  const [width, setWidth] = useState(1080);
-  const [height, setHeight] = useState(1080);
+  const [width, setWidth] = useState(640);
+  const [height, setHeight] = useState(360);
   const [mapHalfWidth, setMapHalfWidth] = useState(150);
   const [arrowSize, setArrowSize] = useState(DEFAULT_ICON_SIZE);
   const [coneAngle, setConeAngle] = useState(60);
@@ -390,6 +390,7 @@ export default function Home() {
   const [showCompass, setShowCompass] = useState(true);
   const [compassSize, setCompassSize] = useState(40);
   const [outputName, setOutputName] = useState("minimapa.mp4");
+  const [useGpu, setUseGpu] = useState(false);
 
   // ========== PATH MODE STATE ==========
   const [videoFile, setVideoFile] = useState<File | null>(null);
@@ -1235,7 +1236,7 @@ export default function Home() {
           icon_circle_size_px: iconCircleSize,
           show_compass: showCompass,
           compass_size_px: compassSize,
-          line_color: DEFAULT_LINE_COLOR, line_width: DEFAULT_LINE_WIDTH, boundary_color: DEFAULT_BOUNDARY_COLOR, boundary_width: DEFAULT_BOUNDARY_WIDTH, point_color: DEFAULT_POINT_COLOR, output_name: safeOutputName, use_gpu: true, workers: 0
+          line_color: DEFAULT_LINE_COLOR, line_width: DEFAULT_LINE_WIDTH, boundary_color: DEFAULT_BOUNDARY_COLOR, boundary_width: DEFAULT_BOUNDARY_WIDTH, point_color: DEFAULT_POINT_COLOR, output_name: safeOutputName, use_gpu: useGpu, workers: 0
         };
 
         const res = await fetch(`${API}/preview`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ config, time_sec: previewTime }) });
@@ -1296,7 +1297,7 @@ export default function Home() {
         icon_circle_size_px: iconCircleSize,
         show_compass: showCompass,
         compass_size_px: compassSize,
-        line_color: DEFAULT_LINE_COLOR, line_width: DEFAULT_LINE_WIDTH, boundary_color: DEFAULT_BOUNDARY_COLOR, boundary_width: DEFAULT_BOUNDARY_WIDTH, point_color: DEFAULT_POINT_COLOR, output_name: safeOutputName, use_gpu: true, workers: 0
+        line_color: DEFAULT_LINE_COLOR, line_width: DEFAULT_LINE_WIDTH, boundary_color: DEFAULT_BOUNDARY_COLOR, boundary_width: DEFAULT_BOUNDARY_WIDTH, point_color: DEFAULT_POINT_COLOR, output_name: safeOutputName, use_gpu: useGpu, workers: 0
       };
 
       const res = await fetch(`${API}/render`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(config) });
@@ -1970,6 +1971,19 @@ export default function Home() {
                         <input type="range" min={20} max={100} step={5} value={compassSize} onChange={(e) => setCompassSize(Number(e.target.value))} className="accent-[var(--accent)]" />
                       </label>
                     )}
+                    <div className="col-span-full border-t border-[var(--line)] pt-2 mt-1">
+                      <label className="flex items-center justify-between gap-2 cursor-pointer bg-white/50 p-2 rounded-lg hover:bg-white/80 transition">
+                        <span className="flex flex-col">
+                          <span className="font-semibold text-[var(--accent)] text-xs">Modo de Procesamiento</span>
+                          <span className="text-[10px] text-[var(--muted)]">{useGpu ? "GPU (Rápido, Nvidia)" : "CPU (Compatibilidad)"}</span>
+                        </span>
+                        <div className="relative">
+                          <input type="checkbox" className="sr-only" checked={useGpu} onChange={(e) => setUseGpu(e.target.checked)} />
+                          <div className={`block h-6 w-10 rounded-full transition-colors ${useGpu ? "bg-emerald-500" : "bg-slate-300"}`}></div>
+                          <div className={`absolute left-1 top-1 h-4 w-4 rounded-full bg-white transition-transform ${useGpu ? "translate-x-4" : "translate-x-0"}`}></div>
+                        </div>
+                      </label>
+                    </div>
                   </div>
                 </section>
                 <section className="rounded-2xl border border-[var(--line)] bg-[var(--panel)] p-4 shadow-lg">
@@ -2159,6 +2173,7 @@ export default function Home() {
                   [SISTEMA] {systemStats?.gpu_name || "GPU..."} - {systemStats?.nvenc_available ? "NVENC" : "NVENC OFF"}
                 </div>
               </section>
+
             </div>
           </main>
         )
@@ -2414,42 +2429,45 @@ export default function Home() {
             </section>
           </div>
         </main>
-      )}
+      )
+      }
 
       {/* Video Modal (Minimap) */}
-      {showVideoModal && minimapExportPath && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
-          <div className="w-full max-w-4xl rounded-2xl bg-white p-6">
-            <video src={`${API}/file?path=${encodeURIComponent(minimapExportPath)}`} controls autoPlay className="w-full rounded-lg" />
-            <div className="mt-4 flex flex-wrap items-center gap-3">
-              {canPickMinimapSave ? (
-                <button
-                  onClick={() => (minimapSaveHandle ? saveMinimapToDisk(minimapExportPath) : pickMinimapSaveFile())}
-                  className="rounded-lg bg-[var(--accent)] px-5 py-2 text-sm font-semibold text-white"
-                >
-                  {minimapSaving ? "Guardando..." : minimapSaveHandle ? "Guardar en PC" : "Elegir destino"}
+      {
+        showVideoModal && minimapExportPath && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
+            <div className="w-full max-w-4xl rounded-2xl bg-white p-6">
+              <video src={`${API}/file?path=${encodeURIComponent(minimapExportPath)}`} controls autoPlay className="w-full rounded-lg" />
+              <div className="mt-4 flex flex-wrap items-center gap-3">
+                {canPickMinimapSave ? (
+                  <button
+                    onClick={() => (minimapSaveHandle ? saveMinimapToDisk(minimapExportPath) : pickMinimapSaveFile())}
+                    className="rounded-lg bg-[var(--accent)] px-5 py-2 text-sm font-semibold text-white"
+                  >
+                    {minimapSaving ? "Guardando..." : minimapSaveHandle ? "Guardar en PC" : "Elegir destino"}
+                  </button>
+                ) : (
+                  <a
+                    href={`${API}/download?path=${encodeURIComponent(minimapExportPath)}`}
+                    className="rounded-lg bg-[var(--accent)] px-5 py-2 text-sm font-semibold text-white"
+                  >
+                    Descargar MP4
+                  </a>
+                )}
+                <button onClick={() => setShowVideoModal(false)} className="rounded-lg bg-slate-200 px-5 py-2 text-sm">
+                  Cerrar
                 </button>
-              ) : (
-                <a
-                  href={`${API}/download?path=${encodeURIComponent(minimapExportPath)}`}
-                  className="rounded-lg bg-[var(--accent)] px-5 py-2 text-sm font-semibold text-white"
-                >
-                  Descargar MP4
-                </a>
+              </div>
+              {minimapSavedPath === minimapExportPath && (
+                <div className="mt-2 text-xs text-emerald-600">Video guardado en tu PC.</div>
               )}
-              <button onClick={() => setShowVideoModal(false)} className="rounded-lg bg-slate-200 px-5 py-2 text-sm">
-                Cerrar
-              </button>
+              {minimapSaveError && (
+                <div className="mt-2 text-xs text-red-600">{minimapSaveError}</div>
+              )}
             </div>
-            {minimapSavedPath === minimapExportPath && (
-              <div className="mt-2 text-xs text-emerald-600">Video guardado en tu PC.</div>
-            )}
-            {minimapSaveError && (
-              <div className="mt-2 text-xs text-red-600">{minimapSaveError}</div>
-            )}
           </div>
-        </div>
-      )}
-    </div>
+        )
+      }
+    </div >
   );
 }

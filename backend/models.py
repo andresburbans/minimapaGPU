@@ -61,7 +61,7 @@ class RenderConfig(BaseModel):
     boundary_width: int = 4
     point_color: str = "#ff9f1c"
     background_opacity: float = 1.0
-    use_gpu: bool = True
+    use_gpu: bool = False
     workers: int = 0
     output_name: str = "minimapa.mp4"
 

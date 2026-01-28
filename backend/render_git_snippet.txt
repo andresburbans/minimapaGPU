@@ -1,0 +1,439 @@
+﻿
+> def render_frame(
+      dataset: rasterio.io.DatasetReader,
+      vectors: List[Tuple[Iterable, str, int, 
+str]],
+      center_e: float,
+      center_n: float,
+      heading: float,
+      width: int,
+      height: int,
+      map_half_width_m: float,
+      arrow_size_px: int,
+      cone_angle_deg: float,
+      cone_length_px: int,
+      cone_opacity: float,
+      icon_circle_opacity: float,
+      icon_circle_size_px: int,
+      show_compass: bool = True,
+      compass_size_px: int = 40,
+  ) -> Image.Image:
+      """Render a single minimap frame.
+      
+      The map rotates so that the direction of 
+travel points DOWNWARD (south on screen),
+      giving the sensation that the map moves 
+from top to bottom as we advance.
+      The navigation icon and radar cone always 
+point UP (north on screen).
+      """
+      res_x, res_y = dataset.res
+      overscan = max(1.0, _ROTATION_OVERSCAN)
+      
+      # To support rotation without black corners 
+and without aspect ratio distortion,
+      # we first define the geographic square 
+that encompasses the diagonal of our view.
+      
+      # Supersampling factor to eliminate 
+flickering (render larger, then scale down)
+      ss_factor = 2
+      
+      # 1. Calculate how many meters are 
+represented by one pixel of the output width
+      meters_per_pixel = (map_half_width_m * 2.0) 
+/ width
+      
+      # 2. Determine the pixel diagonal of the 
+output frame
+      diag_px = math.sqrt(width**2 + height**2)
+      # We add a 15% margin to ensure no corners 
+appear even with slight floating point errors
+      render_size_px = int(diag_px * 1.15)
+      
+      # 3. Apply supersampling to the render size
+      ss_render_size_px = render_size_px * 
+ss_factor
+      
+      # 4. Define the geographic extent of our 
+square render base (in meters)
+      render_size_m = render_size_px * 
+meters_per_pixel
+      
+      # 5. Strictly compute the geographical 
+bounds for this square
+      xmin = center_e - render_size_m / 2
+      xmax = center_e + render_size_m / 2
+      ymin = center_n - render_size_m / 2
+      ymax = center_n + render_size_m / 2
+      
+      # 6. Read the raster data at supersampled 
+resolution
+      window = rasterio.windows.from_bounds(xmin, 
+ymin, xmax, ymax, dataset.transform)
+      
+      data = dataset.read(
+          window=window,
+          out_shape=(dataset.count, 
+ss_render_size_px, ss_render_size_px),
+          resampling=Resampling.bilinear,
+          boundless=True,
+          fill_value=dataset.nodata # Importante 
+para detectar areas fuera del raster
+      )
+      
+      # Procesamiento con transparencia
+      rgb_raw, alpha_raw = _to_rgba(data, 
+nodata_val=dataset.nodata)
+      rgba = _normalize_rgba(rgb_raw, alpha_raw)
+      base = Image.fromarray(rgba, mode="RGBA")
+  
+      # 7. Use supersampled mapping for vector 
+drawing
+      draw = ImageDraw.Draw(base, "RGBA")
+      def map_to_px(e, n):
+          px = (e - xmin) / (xmax - xmin) * 
+ss_render_size_px
+          py = (ymax - n) / (ymax - ymin) * 
+ss_render_size_px
+          return px, py
+  
+      for geom_iter, color, line_width, pattern 
+in vectors:
+          for geom in geom_iter:
+              # Multiply line_width by ss_factor 
+to maintain scale
+              _draw_geometry_precise(draw, geom, 
+map_to_px, color, int(line_width * ss_factor), 
+pattern)
+  
+      # 8. Downsample to the intended render size 
+(this provides high-quality anti-aliasing)
+      # Use Image.LANCZOS for the best reduction 
+quality
+      base = base.resize((render_size_px, 
+render_size_px), resample=Image.LANCZOS)
+  
+      # 9. Rotate the map so that direction of 
+travel (destination B) always points UP.
+      rotation_angle = heading
+      rotated = _rotate_image(base, 
+rotation_angle, target_size=(width, height))
+      
+      center_px = (width // 2, height // 2)
+      
+      # In this mode, the icon and radar always 
+point forward (UP)
+      # because the world rotates around the 
+vehicle.
+      _draw_cone(rotated, center_px, 0.0, 
+cone_angle_deg, cone_length_px, cone_opacity)
+      _draw_center_icon(
+          rotated,
+          center_px,
+          arrow_size_px,
+          icon_circle_opacity,
+          icon_circle_size_px,
+          0.0,  # Icon always points UP
+      )
+      
+      # Draw compass showing true north
+      # If the map is rotated by 'heading' (CCW), 
+North is at angle -heading (CW) from the top.
+      if show_compass:
+          compass_size = max(15, compass_size_px)
+          compass_margin = max(10, compass_size 
+// 2)
+          compass_pos = (width - compass_margin - 
+compass_size, compass_margin + compass_size)
+          _draw_compass(rotated, compass_pos, 
+compass_size, -heading)
+      
+      return rotated
+  
+  
+  def _draw_compass(img: Image.Image, center: 
+Tuple[int, int], size: int, heading: float) -> 
+None:
+      """Draw a compass indicator showing true 
+north direction.
+      
+      The compass rotates to show where 
+geographic north is relative to the current view.
+      If the map is rotated by ╬©, North 
+(originally up) is now at -╬©.
+      """
+      cx, cy = center
+      # North is at 'heading' angle from current 
+vertical UP
+      north_angle_rad = math.radians(heading)
+      
+      # Draw subtle background circle
+      overlay = Image.new("RGBA", img.size, (0, 
+0, 0, 0))
+      draw = ImageDraw.Draw(overlay, "RGBA")
+      bg_radius = int(size * 1.1)
+      draw.ellipse(
+          (cx - bg_radius, cy - bg_radius, cx + 
+bg_radius, cy + bg_radius),
+          fill=(0, 0, 0, 80)
+      )
+      img.alpha_composite(overlay)
+      
+      # Draw north arrow (red)
+      north_tip = (
+          cx + size * math.sin(north_angle_rad),
+          cy - size * math.cos(north_angle_rad)
+      )
+      north_base_l = (
+          cx + size * 0.3 * 
+math.sin(north_angle_rad + math.radians(140)),
+          cy - size * 0.3 * 
+math.cos(north_angle_rad + math.radians(140))
+      )
+      north_base_r = (
+          cx + size * 0.3 * 
+math.sin(north_angle_rad - math.radians(140)),
+          cy - size * 0.3 * 
+math.cos(north_angle_rad - math.radians(140))
+      )
+      
+      draw2 = ImageDraw.Draw(img, "RGBA")
+      draw2.polygon([north_tip, north_base_l, 
+(cx, cy), north_base_r], fill=(220, 60, 60, 230))
+      
+      # Draw south arrow (white/gray)
+      south_angle_rad = north_angle_rad + math.pi
+      south_tip = (
+          cx + size * 0.6 * 
+math.sin(south_angle_rad),
+          cy - size * 0.6 * 
+math.cos(south_angle_rad)
+      )
+      south_base_l = (
+          cx + size * 0.25 * 
+math.sin(south_angle_rad + math.radians(140)),
+          cy - size * 0.25 * 
+math.cos(south_angle_rad + math.radians(140))
+      )
+      south_base_r = (
+          cx + size * 0.25 * 
+math.sin(south_angle_rad - math.radians(140)),
+          cy - size * 0.25 * 
+math.cos(south_angle_rad - math.radians(140))
+      )
+      draw2.polygon([south_tip, south_base_l, 
+(cx, cy), south_base_r], fill=(200, 200, 200, 
+180))
+      
+      # Draw "N" label near north arrow
+      try:
+          from PIL import ImageFont
+          font_size = max(8, size // 3)
+          try:
+              font = 
+ImageFont.truetype("arial.ttf", font_size)
+          except:
+              font = ImageFont.load_default()
+          n_pos = (
+              cx + (size + font_size) * 
+math.sin(north_angle_rad) - font_size // 2,
+              cy - (size + font_size) * 
+math.cos(north_angle_rad) - font_size // 2
+          )
+          draw2.text(n_pos, "N", fill=(255, 80, 
+80, 255), font=font)
+      except:
+          pass  # Skip text if font not available
+  
+  
+  def _draw_geometry_precise(
+      draw: ImageDraw.ImageDraw, geom, map_func, 
+color: str, line_width: int, pattern: str
+  ) -> None:
+      if geom.is_empty:
+          return
+      if isinstance(geom, LineString):
+          coords = [map_func(pt[0], pt[1]) for pt 
+in geom.coords]
+          _draw_path(draw, coords, color, 
+line_width, pattern)
+      elif isinstance(geom, Polygon):
+          exterior = [map_func(pt[0], pt[1]) for 
+pt in geom.exterior.coords]
+          _draw_path(draw, exterior, color, 
+line_width, pattern)
+          for interior in geom.interiors:
+              interior_coords = [map_func(pt[0], 
+pt[1]) for pt in interior.coords]
+              _draw_path(draw, interior_coords, 
+color, line_width, pattern)
+      elif isinstance(geom, Point):
+          x, y = map_func(geom.x, geom.y)
+          r = max(line_width, 3)
+> def render_frame_job(job: Tuple[int, float, 
+float, float, str]) -> int:
+      """
+      Render a single frame with WMS background 
+and orthomosaic overlay.
+      
+>     IMPORTANT: Uses exactly the same geometry 
+calculations as render_frame()
+      to ensure pixel-perfect alignment between 
+WMS and orthomosaic layers.
+      """
+      idx, center_e, center_n, heading, 
+frame_path = job
+      width = _GLOBAL_SETTINGS["width"]
+      height = _GLOBAL_SETTINGS["height"]
+      map_half_width_m = 
+_GLOBAL_SETTINGS["map_half_width_m"]
+      arrow_size_px = 
+_GLOBAL_SETTINGS["arrow_size_px"]
+      cone_angle_deg = 
+_GLOBAL_SETTINGS["cone_angle_deg"]
+      cone_length_px = 
+_GLOBAL_SETTINGS["cone_length_px"]
+      cone_opacity = 
+_GLOBAL_SETTINGS["cone_opacity"]
+      icon_circle_opacity = 
+_GLOBAL_SETTINGS["icon_circle_opacity"]
+      icon_circle_size_px = 
+_GLOBAL_SETTINGS["icon_circle_size_px"]
+      show_compass = 
+_GLOBAL_SETTINGS.get("show_compass", True)
+      compass_size_px = 
+_GLOBAL_SETTINGS.get("compass_size_px", 40)
+  
+>     # === CRITICAL: Use EXACTLY the same 
+geometry as render_frame() ===
+      # This ensures WMS and ortho layers are 
+perfectly aligned
+      meters_per_pixel = (map_half_width_m * 2.0) 
+/ width
+      diag_px = math.sqrt(width**2 + height**2)
+>     render_size_px = int(diag_px * 1.15)  # 
+Same 15% margin as render_frame
+      render_size_m = render_size_px * 
+meters_per_pixel
+  
+      # Use a safe margin for clipping vectors
+      clip_margin = map_half_width_m * 2.0
+      bbox = (
+          center_e - clip_margin,
+          center_n - clip_margin,
+          center_e + clip_margin,
+          center_n + clip_margin,
+      )
+      
+      # === 1. Render WMS Base ===
+      try:
+          w_geo, s_geo, e_geo, n_geo = 
+transform_bounds(
+              _GLOBAL_DATASET.crs, 
+              "EPSG:4326", 
+              bbox[0], bbox[1], bbox[2], bbox[3], 
+              densify_pts=21
+          )
+          zoom = 19
+          
+          mosaic_img, (mosaic_left_glob, 
+mosaic_top_glob) = 
+_fetch_wms_mosaic_for_bounds(w_geo, s_geo, e_geo, 
+n_geo, zoom)
+          
+          # Calculate center relative to mosaic
+          center_lon_geo = (w_geo + e_geo) / 2
+          center_lat_geo = (s_geo + n_geo) / 2
+          cx_glob, cy_glob = 
+_latlon_to_pixel(center_lat_geo, center_lon_geo, 
+zoom)
+          
+          rel_cx = cx_glob - mosaic_left_glob
+          rel_cy = cy_glob - mosaic_top_glob
+          
+          # === CRITICAL: Use render_size_px for 
+crop, same as ortho ===
+          # This ensures both layers have 
+identical pre-rotation geometry
+          crop_size = render_size_px
+          crop_l = int(rel_cx - crop_size / 2)
+          crop_t = int(rel_cy - crop_size / 2)
+          crop_r = crop_l + crop_size
+          crop_b = crop_t + crop_size
+          
+          # Handle edge cases where mosaic might 
+be smaller
+          ms_w, ms_h = mosaic_img.size
+          
+          # Create a properly sized crop with 
+padding if needed
+          wms_crop = Image.new("RGB", (crop_size, 
+crop_size), (20, 20, 20))
+          
+          # Calculate source and destination 
+regions
+          src_l = max(0, crop_l)
+          src_t = max(0, crop_t)
+          src_r = min(ms_w, crop_r)
+          src_b = min(ms_h, crop_b)
+          
+          dst_l = max(0, -crop_l)
+          dst_t = max(0, -crop_t)
+          
+          if src_r > src_l and src_b > src_t:
+              region = mosaic_img.crop((src_l, 
+src_t, src_r, src_b))
+              wms_crop.paste(region, (dst_l, 
+dst_t))
+          
+          # Rotate WMS using the SAME function 
+and target_size as ortho
+          wms_rotated = _rotate_image(wms_crop, 
+heading if heading else 0, (width, height))
+          base_frame = wms_rotated.convert("RGBA")
+          
+      except Exception as e:
+          print(f"WMS Fail: {e}")
+          base_frame = Image.new("RGBA", (width, 
+height), (20, 20, 20, 255))
+  
+      clipped = clip_vectors(_GLOBAL_VECTORS, 
+bbox)
+      
+      # Render ortho layer (uses same geometry 
+internally)
+>     frame = render_frame(
+          _GLOBAL_DATASET,
+          clipped,
+          center_e,
+          center_n,
+          heading,
+          width,
+          height,
+          map_half_width_m,
+          arrow_size_px,
+          cone_angle_deg,
+          cone_length_px,
+          cone_opacity,
+          icon_circle_opacity,
+          icon_circle_size_px,
+          show_compass,
+          compass_size_px,
+      )
+      
+      if frame.mode != "RGBA":
+          frame = frame.convert("RGBA")
+      
+      if base_frame.size != (width, height):
+          base_frame = base_frame.resize((width, 
+height), Image.LANCZOS)
+  
+      # Composite: ortho over WMS
+      final_image = 
+Image.alpha_composite(base_frame, frame)
+      final_image.save(frame_path, "PNG")
+      return 1
+  
+
+

@@ -7,8 +7,9 @@ import subprocess
 import threading
 import uuid
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Any
 from multiprocessing import get_context
+from PIL import Image
 
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,7 +28,12 @@ from render import (
 )
 import gpu_utils  # Auto-detecta y configura GPU al importar
 try:
-    from render_gpu import render_frame_gpu, init_gpu
+    from render_gpu import (
+        render_frame_gpu,
+        init_gpu,
+        preload_track_gpu,
+        cleanup_gpu,
+    )
     GPU_RENDER_AVAILABLE = True
 except ImportError:
     GPU_RENDER_AVAILABLE = False
@@ -172,6 +178,40 @@ async def cleanup_data_endpoint():
     }
 
 
+def _dispatch_render(cfg: RenderConfig, dataset: rasterio.io.DatasetReader, vectors: list, center_e: float, center_n: float, heading: float, job_id: Optional[str] = None, frame_idx: Optional[int] = None) -> Image.Image:
+    """Helper to dispatch rendering to GPU or CPU with automatic fallback."""
+    render_params = {
+        "dataset": dataset,
+        "vectors": vectors,
+        "center_e": center_e,
+        "center_n": center_n,
+        "heading": heading,
+        "width": cfg.width,
+        "height": cfg.height,
+        "map_half_width_m": cfg.map_half_width_m,
+        "arrow_size_px": cfg.arrow_size_px,
+        "cone_angle_deg": cfg.cone_angle_deg,
+        "cone_length_px": cfg.cone_length_px,
+        "cone_opacity": cfg.cone_opacity,
+        "icon_circle_opacity": cfg.icon_circle_opacity,
+        "icon_circle_size_px": cfg.icon_circle_size_px,
+        "show_compass": cfg.show_compass,
+        "compass_size_px": cfg.compass_size_px,
+    }
+
+    if cfg.use_gpu and GPU_RENDER_AVAILABLE:
+        try:
+            return render_frame_gpu(**render_params)
+        except Exception as e:
+            err_msg = f"[GPU] Error rendering {'preview' if frame_idx is None else f'frame {frame_idx}'}: {e}. Falling back to CPU."
+            print(err_msg)
+            if job_id:
+                _update_job(job_id, log=err_msg)
+    
+    # Default/Fallback to CPU
+    return render_frame(**render_params)
+
+
 @app.post("/preview")
 async def preview(req: PreviewRequest):
     cfg = req.config
@@ -200,44 +240,9 @@ async def preview(req: PreviewRequest):
             center_n + clip_margin,
         )
         vectors = clip_vectors(vectors, bbox)
-        if cfg.use_gpu and GPU_RENDER_AVAILABLE:
-            frame = render_frame_gpu(
-                dataset,
-                vectors,
-                center_e,
-                center_n,
-                heading,
-                cfg.width,
-                cfg.height,
-                cfg.map_half_width_m,
-                cfg.arrow_size_px,
-                cfg.cone_angle_deg,
-                cfg.cone_length_px,
-                cfg.cone_opacity,
-                cfg.icon_circle_opacity,
-                cfg.icon_circle_size_px,
-                cfg.show_compass,
-                cfg.compass_size_px,
-            )
-        else:
-            frame = render_frame(
-                dataset,
-                vectors,
-                center_e,
-                center_n,
-                heading,
-                cfg.width,
-                cfg.height,
-                cfg.map_half_width_m,
-                cfg.arrow_size_px,
-                cfg.cone_angle_deg,
-                cfg.cone_length_px,
-                cfg.cone_opacity,
-                cfg.icon_circle_opacity,
-                cfg.icon_circle_size_px,
-                cfg.show_compass,
-                cfg.compass_size_px,
-            )
+        # Dispatch rendering (handles GPU/CPU switch and fallback)
+        frame = _dispatch_render(cfg, dataset, vectors, center_e, center_n, heading)
+            
         buf = io.BytesIO()
         frame.save(buf, format="PNG")
         return Response(content=buf.getvalue(), media_type="image/png")
@@ -839,51 +844,17 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                             center_n + clip_margin,
                         )
                         clipped = clip_vectors(vectors, bbox)
-                        if config.use_gpu and GPU_RENDER_AVAILABLE:
-                             frame = render_frame_gpu(
-                                dataset,
-                                clipped,
-                                center_e,
-                                center_n,
-                                heading,
-                                config.width,
-                                config.height,
-                                config.map_half_width_m,
-                                config.arrow_size_px,
-                                config.cone_angle_deg,
-                                config.cone_length_px,
-                                config.cone_opacity,
-                                config.icon_circle_opacity,
-                                config.icon_circle_size_px,
-                                config.show_compass,
-                                config.compass_size_px,
-                            )
-                        else:
-                            frame = render_frame(
-                                dataset,
-                                clipped,
-                                center_e,
-                                center_n,
-                                heading,
-                                config.width,
-                                config.height,
-                                config.map_half_width_m,
-                                config.arrow_size_px,
-                                config.cone_angle_deg,
-                                config.cone_length_px,
-                                config.cone_opacity,
-                                config.icon_circle_opacity,
-                                config.icon_circle_size_px,
-                                config.show_compass,
-                                config.compass_size_px,
-                            )
+                        # Dispatch rendering (handles GPU/CPU switch and fallback)
+                        frame = _dispatch_render(config, dataset, clipped, center_e, center_n, heading, job_id=job_id, frame_idx=idx)
 
                         frame.save(frame_path, "PNG")
                         frame_cache[cache_key] = frame_path
                     
                     # Calculate ETA
+                    # Calculate ETA
                     elapsed = time.time() - start_time
                     frames_done = idx + 1
+                    
                     if frames_done > 0 and elapsed > 0:
                         fps_rate = frames_done / elapsed
                         remaining = total_frames - frames_done
@@ -947,6 +918,10 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
         _update_job(job_id, status="finished", progress=len(jobs), message=f"Finalizado en {_format_eta(total_time)}", log=f"Tiempo total: {_format_eta(total_time)}")
     except Exception as exc:
         _update_job(job_id, status="error", message="Error en render", log=str(exc), error=str(exc))
+    finally:
+        if GPU_RENDER_AVAILABLE:
+            # Liberar memoria GPU al terminar (éxito o error)
+            cleanup_gpu()
 
 
 def _track_task(job_id: str, req: TrackRequest, output_path: Path) -> None:
