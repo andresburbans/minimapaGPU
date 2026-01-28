@@ -4,7 +4,87 @@ Prioriza el uso de GPU dedicada (RTX 3050) sobre CPU para procesamiento.
 """
 import os
 import subprocess
+import sys
+import site
+from pathlib import Path
 from typing import Optional, Dict
+
+
+def fix_cuda_dll_paths():
+    """
+    Agrega directorios de DLLs de NVIDIA al PATH y al search path de DLLs (Python 3.8+).
+    Resuelve el error 'CuPy failed to load nvrtc64_120_0.dll'.
+    """
+    if sys.platform != "win32":
+        return
+
+    # Lista de DLLs críticas que buscamos (runtime y nvrtc)
+    # A menudo estas son las que fallan con CuPy
+    target_dlls = ["nvrtc64_120_0.dll", "cudart64_12.dll"]
+    
+    # Directorios donde buscar: site-packages, pero también la raíz del venv o sys.prefix
+    search_roots = [sys.prefix]
+    try:
+        search_roots.extend(site.getsitepackages())
+    except AttributeError:
+        pass
+    if hasattr(site, 'getusersitepackages'):
+        search_roots.append(site.getusersitepackages())
+
+    # Eliminar duplicados y convertir a Path
+    search_roots = list(set([Path(p) for p in search_roots]))
+    
+    added_paths = set()
+    
+    print(f"[GPU] Buscando librerías CUDA en: {[str(p) for p in search_roots]}...")
+
+    # Estrategia 1: Buscar carpetas 'nvidia/*/bin' (estándar pip)
+    for root in search_roots:
+        nvidia_base = root / "lib" / "site-packages" / "nvidia" # Ajuste comun venv windows
+        if not nvidia_base.exists():
+             nvidia_base = root / "nvidia" # Intentar directo
+        
+        if nvidia_base.exists():
+            for bin_dir in nvidia_base.rglob("bin"):
+                if bin_dir.is_dir():
+                    path_str = str(bin_dir.absolute())
+                    if path_str not in added_paths:
+                        try:
+                            os.add_dll_directory(path_str)
+                            if path_str not in os.environ["PATH"]:
+                                os.environ["PATH"] = path_str + os.pathsep + os.environ["PATH"]
+                            added_paths.add(path_str)
+                        except Exception:
+                            pass
+
+    # Estrategia 2: Fuerza bruta - buscar el archivo DLL específico si aún no parece cargado
+    # Esto es lento pero seguro si la estructura de carpetas cambió
+    found_any = False
+    for root in search_roots:
+        for dll_name in target_dlls:
+            # Rglob puede ser lento, limitamos a subcarpetas probables si es posible, o root
+            # Buscamos en todo el root del venv por si acaso
+            try:
+                found = list(root.rglob(dll_name))
+                for f in found:
+                    parent = str(f.parent.absolute())
+                    if parent not in added_paths:
+                        try:
+                            os.add_dll_directory(parent)
+                            if parent not in os.environ["PATH"]:
+                                os.environ["PATH"] = parent + os.pathsep + os.environ["PATH"]
+                            added_paths.add(parent)
+                            print(f"[GPU] DLL crítico encontrado y ruta agregada: {parent}")
+                            found_any = True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+                
+    if added_paths:
+        print(f"[GPU] Se agregaron {len(added_paths)} directorios de DLLs de NVIDIA al search path.")
+    else:
+        print("[GPU] ADVERTENCIA: No se encontraron directorios de DLLs de NVIDIA. CuPy podría fallar.")
 
 
 _GPU_INFO: Optional[Dict] = None
@@ -158,6 +238,7 @@ def get_system_stats() -> Dict:
 # Inicializar GPU al importar el módulo
 def _auto_init():
     """Auto-inicialización al importar."""
+    fix_cuda_dll_paths()
     info = detect_cuda_gpu()
     if info["cuda_available"]:
         force_cuda_gpu()

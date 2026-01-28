@@ -706,7 +706,7 @@ def _fetch_wms_mosaic_for_bounds(west: float, south: float, east: float, north: 
     
     # Cap tiles if too large
     if tiles_x * tiles_y > 100:
-        return Image.new("RGB", (100, 100), (0,0,0)), (0,0,0,0)
+        return Image.new("RGB", (100, 100), (0,0,0)), (0,0)
 
     mosaic = Image.new("RGB", (tiles_x * 256, tiles_y * 256), (20, 20, 20))
     for ty in range(min_ty, max_ty + 1):
@@ -1026,6 +1026,12 @@ def init_worker(
 
 
 def render_frame_job(job: Tuple[int, float, float, float, str]) -> int:
+    """
+    Render a single frame with WMS background and orthomosaic overlay.
+    
+    IMPORTANT: Uses exactly the same geometry calculations as render_frame()
+    to ensure pixel-perfect alignment between WMS and orthomosaic layers.
+    """
     idx, center_e, center_n, heading, frame_path = job
     width = _GLOBAL_SETTINGS["width"]
     height = _GLOBAL_SETTINGS["height"]
@@ -1039,7 +1045,14 @@ def render_frame_job(job: Tuple[int, float, float, float, str]) -> int:
     show_compass = _GLOBAL_SETTINGS.get("show_compass", True)
     compass_size_px = _GLOBAL_SETTINGS.get("compass_size_px", 40)
 
-    # Use a safe margin for clipping vectors to avoid truncation during rotation
+    # === CRITICAL: Use EXACTLY the same geometry as render_frame() ===
+    # This ensures WMS and ortho layers are perfectly aligned
+    meters_per_pixel = (map_half_width_m * 2.0) / width
+    diag_px = math.sqrt(width**2 + height**2)
+    render_size_px = int(diag_px * 1.15)  # Same 15% margin as render_frame
+    render_size_m = render_size_px * meters_per_pixel
+
+    # Use a safe margin for clipping vectors
     clip_margin = map_half_width_m * 2.0
     bbox = (
         center_e - clip_margin,
@@ -1048,7 +1061,7 @@ def render_frame_job(job: Tuple[int, float, float, float, str]) -> int:
         center_n + clip_margin,
     )
     
-    # === 1. Renderizar WMS Base ===
+    # === 1. Render WMS Base ===
     try:
         w_geo, s_geo, e_geo, n_geo = transform_bounds(
             _GLOBAL_DATASET.crs, 
@@ -1056,12 +1069,11 @@ def render_frame_job(job: Tuple[int, float, float, float, str]) -> int:
             bbox[0], bbox[1], bbox[2], bbox[3], 
             densify_pts=21
         )
-        # Zoom alto fijo para buena resolucion en video
         zoom = 19
         
         mosaic_img, (mosaic_left_glob, mosaic_top_glob) = _fetch_wms_mosaic_for_bounds(w_geo, s_geo, e_geo, n_geo, zoom)
         
-        # Calcular centro relativo para centrar el WMS igual que el Ortho
+        # Calculate center relative to mosaic
         center_lon_geo = (w_geo + e_geo) / 2
         center_lat_geo = (s_geo + n_geo) / 2
         cx_glob, cy_glob = _latlon_to_pixel(center_lat_geo, center_lon_geo, zoom)
@@ -1069,28 +1081,44 @@ def render_frame_job(job: Tuple[int, float, float, float, str]) -> int:
         rel_cx = cx_glob - mosaic_left_glob
         rel_cy = cy_glob - mosaic_top_glob
         
-        # Crop y Rotacion
-        ms_w, ms_h = mosaic_img.size
-        # Usamos overscan para rotacion
-        crop_size = max(width, height) * 2 
+        # === CRITICAL: Use render_size_px for crop, same as ortho ===
+        # This ensures both layers have identical pre-rotation geometry
+        crop_size = render_size_px
         crop_l = int(rel_cx - crop_size / 2)
         crop_t = int(rel_cy - crop_size / 2)
         crop_r = crop_l + crop_size
         crop_b = crop_t + crop_size
         
-        mosaic_crop = mosaic_img.crop((crop_l, crop_t, crop_r, crop_b))
-        wms_rotated = _rotate_image(mosaic_crop, heading if heading else 0, (width, height))
+        # Handle edge cases where mosaic might be smaller
+        ms_w, ms_h = mosaic_img.size
+        
+        # Create a properly sized crop with padding if needed
+        wms_crop = Image.new("RGB", (crop_size, crop_size), (20, 20, 20))
+        
+        # Calculate source and destination regions
+        src_l = max(0, crop_l)
+        src_t = max(0, crop_t)
+        src_r = min(ms_w, crop_r)
+        src_b = min(ms_h, crop_b)
+        
+        dst_l = max(0, -crop_l)
+        dst_t = max(0, -crop_t)
+        
+        if src_r > src_l and src_b > src_t:
+            region = mosaic_img.crop((src_l, src_t, src_r, src_b))
+            wms_crop.paste(region, (dst_l, dst_t))
+        
+        # Rotate WMS using the SAME function and target_size as ortho
+        wms_rotated = _rotate_image(wms_crop, heading if heading else 0, (width, height))
         base_frame = wms_rotated.convert("RGBA")
         
     except Exception as e:
-        # Fallback silencioso si falla internet o bounds
         print(f"WMS Fail: {e}")
         base_frame = Image.new("RGBA", (width, height), (20, 20, 20, 255))
 
     clipped = clip_vectors(_GLOBAL_VECTORS, bbox)
     
-    # Renderizamos la capa del ortomosaico + vectores
-    # render_frame genera la vista usual
+    # Render ortho layer (uses same geometry internally)
     frame = render_frame(
         _GLOBAL_DATASET,
         clipped,
@@ -1114,15 +1142,10 @@ def render_frame_job(job: Tuple[int, float, float, float, str]) -> int:
         frame = frame.convert("RGBA")
     
     if base_frame.size != (width, height):
-         base_frame = base_frame.resize((width, height))
+        base_frame = base_frame.resize((width, height), Image.LANCZOS)
 
-    # Componer WMS debajo del Ortho
-    # Ortho tiene transparencia donde no hay datos? _render_ortho_patch debe devolver RGBA con transparencia.
-    # SI no, el WMS no se verá. Asumimos que _render_ortho_patch en los pasos anteriores ya
-    # devuelve RGBA en zonas validas y transparencia fuera.
-    # Si la funcion original _render_ortho_patch rellena con negro (0), necesitamos alpha.
-    
-    # Composite:
+    # Composite: ortho over WMS
     final_image = Image.alpha_composite(base_frame, frame)
     final_image.save(frame_path, "PNG")
     return 1
+

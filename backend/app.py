@@ -25,6 +25,7 @@ from render import (
     init_worker,
     render_frame_job,
 )
+import gpu_utils  # Auto-detecta y configura GPU al importar
 try:
     from render_gpu import render_frame_gpu, init_gpu
     GPU_RENDER_AVAILABLE = True
@@ -35,7 +36,6 @@ except ImportError:
 
 
 from track import track_points, render_overlay
-import gpu_utils  # Auto-detecta y configura GPU al importar
 
 import rasterio
 from rasterio.enums import Resampling
@@ -771,8 +771,11 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
     import shutil as shutil_mod
     
     try:
+        if config.use_gpu:
+            import gpu_utils
+            gpu_utils.force_cuda_gpu()
+            
         # If GPU is enabled, we MUST run in a single process/thread to maintain CUDA context
-        # and avoid overhead. multiprocessing with CUDA is complex.
         if config.use_gpu and GPU_RENDER_AVAILABLE:
             workers = 1
             # Check GPU status
@@ -795,6 +798,18 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
         cache_precision = 4
         cache_hits = 0
         if workers <= 1:
+            # OPTIMIZATION: Pre-load whole track area to GPU if available
+            if config.use_gpu and GPU_RENDER_AVAILABLE:
+                try:
+                    from render_gpu import preload_track_gpu
+                    _update_job(job_id, log="Optimizando texturas en GPU para máxima velocidad...")
+                    preload_track_gpu(config, jobs)
+                except Exception as e:
+                    _update_job(job_id, log=f"Aviso: Falló precarga GPU ({e}). Cambiando a renderizado CPU multicore.")
+                    config.use_gpu = False
+                    # Recalculate workers for CPU mode
+                    workers = config.workers if config.workers > 0 else max(1, (os.cpu_count() or 2) - 1)
+
             with rasterio.open(config.ortho_path) as dataset:
                 vectors = load_vectors(
                     dataset.crs,
