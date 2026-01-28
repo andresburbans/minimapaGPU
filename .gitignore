@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node / Web
+node_modules/
+.next/
+dist/
+build/
+.editorconfig
+.eslintcache
+.stylelintcache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Project Specific
+backend/data/*
+!backend/data/.gitkeep
+backend/outputs/*
+!backend/outputs/.gitkeep
+backend/temp/*
+!backend/temp/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+*.log

@@ -1,0 +1,8 @@
+﻿{
+  "name": "minimapagpt",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix web run dev",
+    "lint": "npm --prefix web run lint"
+  }
+}

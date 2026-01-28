@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #0b1218;
+  --bg-muted: #0f1b24;
+  --panel: #111b25;
+  --line: #203040;
+  --text: #e6edf3;
+  --muted: #8aa0b2;
+  --accent: #23c4ff;
+  --accent-2: #ff9f1c;
+}
+
+@theme inline {
+  --color-background: var(--bg);
+  --color-foreground: var(--text);
+  --font-sans: var(--font-space);
+  --font-mono: var(--font-mono);
+}
+
+body {
+  color: var(--text);
+  background: radial-gradient(1200px 800px at 10% 10%, #0f2433 0%, #0b1218 40%, #070b0f 100%);
+  font-family: var(--font-space), system-ui, sans-serif;
+}
+
+.mono {
+  font-family: var(--font-mono), ui-monospace, monospace;
+}
+
+.path-theme {
+  --bg: #f7f9ff;
+  --bg-muted: #edf2ff;
+  --panel: rgba(255, 255, 255, 0.82);
+  --line: rgba(148, 163, 184, 0.35);
+  --text: #0f172a;
+  --muted: #5f6f82;
+  --accent: #3aa7ff;
+  --accent-2: #ffb36b;
+  font-family: var(--font-space), system-ui, sans-serif;
+  color: var(--text);
+  background: radial-gradient(1200px 800px at 10% 10%, #fce7f3 0%, #f8fbff 45%, #e0f2fe 100%);
+}
+
+.minimap-theme {
+  --bg: #f4f7ff;
+  --bg-muted: #eaf0fb;
+  --panel: rgba(255, 255, 255, 0.9);
+  --line: rgba(148, 163, 184, 0.38);
+  --text: #0b1b2b;
+  --muted: #5d6b7a;
+  --accent: #1aa6ff;
+  --accent-2: #ffb36b;
+  font-family: var(--font-space), system-ui, sans-serif;
+  color: var(--text);
+  background: radial-gradient(1200px 800px at 8% 12%, #e0f2fe 0%, #f7faff 50%, #e8f5e9 100%);
+}
