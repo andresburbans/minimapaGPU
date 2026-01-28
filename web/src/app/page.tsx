@@ -909,9 +909,28 @@ export default function Home() {
   const handleMapWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();
     e.stopPropagation();
+
+    if (!mapContainerRef.current) return;
+    const rect = mapContainerRef.current.getBoundingClientRect();
+
+    // Mouse position relative to container
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+
     const delta = e.deltaY > 0 ? 0.9 : 1.1;
-    setMapZoom((prev) => Math.max(0.1, Math.min(10, prev * delta)));
-  }, []);
+    const newZoom = Math.max(0.1, Math.min(10, mapZoom * delta));
+
+    if (newZoom !== mapZoom) {
+      // Adjustment to mapOffset to zoom towards mouse position
+      // Formula: offset = mouse_pos - (mouse_pos - old_offset) * (new_zoom / old_zoom)
+      const ratio = newZoom / mapZoom;
+      const newOffsetX = mouseX - (mouseX - mapOffset.x) * ratio;
+      const newOffsetY = mouseY - (mouseY - mapOffset.y) * ratio;
+
+      setMapZoom(newZoom);
+      setMapOffset({ x: newOffsetX, y: newOffsetY });
+    }
+  }, [mapZoom, mapOffset]);
 
   const handleMapMouseDown = useCallback((e: ReactMouseEvent) => {
     e.preventDefault();
@@ -2054,15 +2073,17 @@ export default function Home() {
                           onChange={(e) => handleVectorFileChange(idx, e.target.files?.[0] ?? null)}
                           className="mt-2 w-full rounded-xl border border-[var(--line)] bg-white/80 px-4 py-3 text-xs file:mr-4 file:rounded-lg file:border-0 file:bg-slate-200 file:px-4"
                         />
-                        {layer.file && (
-                          <div className="mt-2 text-xs text-[var(--muted)]">{layer.file.name}</div>
+                        {(layer.file || layer.ref) && (
+                          <div className="mt-2 text-xs text-[var(--muted)]">
+                            {layer.file ? layer.file.name : (layer.ref as any)?.filename || "Capa vinculada"}
+                          </div>
                         )}
                         {layer.error && (
                           <div className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600">
                             {layer.error}
                           </div>
                         )}
-                        {layer.file && (
+                        {(layer.file || layer.ref) && (
                           <div className="mt-3 grid gap-3 text-xs md:grid-cols-3">
                             <label className="flex flex-col gap-1 text-[11px] text-[var(--muted)]">
                               Color
