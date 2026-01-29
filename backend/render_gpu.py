@@ -13,6 +13,7 @@ from rasterio.windows import from_bounds
 from rasterio.warp import transform_bounds, transform
 from rasterio.transform import Affine
 from PIL import Image, ImageDraw, ImageOps
+from pyproj import CRS, Transformer
 
 import gpu_utils 
 
@@ -36,7 +37,6 @@ try:
         _draw_cone,
         _draw_center_icon,
         load_vectors,
-        clip_vectors,
         _GLOBAL_NAV_ICON,
         _fetch_wms_mosaic_for_bounds,
         _latlon_to_pixel,
@@ -71,93 +71,284 @@ def init_gpu():
     except Exception as e:
         return {"available": False, "error": str(e)}
 
+def _sample_using_inverse_transform(
+    texture: cp.ndarray,
+    center_e: float,
+    center_n: float,
+    heading: float,
+    m_per_px: float,
+    out_h: int,
+    out_w: int,
+    ortho_transform: Affine
+) -> cp.ndarray:
+    """
+    Sample from texture using direct inverse transform approach.
+    FIX: Uses -heading to ensure Camera Up aligns with Travel Direction.
+    """
+    # Rotation Correction: 
+    # We want top of screen (negative screen Y) to correspond to "Target Heading".
+    # Analysis showed we need to negate heading for standard geometric rotation.
+    rad = math.radians(-heading) 
+    cos_h = math.cos(rad)
+    sin_h = math.sin(rad)
+    
+    # Create coordinate grids on GPU
+    # Centered grid
+    tc, tr = cp.meshgrid(
+        cp.arange(out_w, dtype=cp.float64) - out_w / 2.0,
+        cp.arange(out_h, dtype=cp.float64) - out_h / 2.0
+    )
+    
+    # Geo offset from center (unrotated)
+    geo_dx = tc * m_per_px
+    geo_dy = -tr * m_per_px  # Screen Y increases down, Geo N increases up.
+    
+    # Apply rotation
+    geo_e = center_e + geo_dx * cos_h - geo_dy * sin_h
+    geo_n = center_n + geo_dx * sin_h + geo_dy * cos_h
+    
+    # Geo (E, N) -> Input Pixel (c, r) via inverse transform
+    inv_tf = ~ortho_transform
+    
+    src_c = inv_tf.a * geo_e + inv_tf.b * geo_n + inv_tf.c
+    src_r = inv_tf.d * geo_e + inv_tf.e * geo_n + inv_tf.f
+    
+    # Stack coordinates for map_coordinates: (2, H, W) -> (row, col)
+    # Ensure float32 output for map_coordinates if needed, or keep float64
+    coordinates = cp.stack([src_r, src_c])
+    
+    # Sample each channel
+    texture_c = texture
+    if texture.shape[2] == 4:
+         texture_c = cp.transpose(texture, (2, 0, 1)) # (C, H, W)
+    
+    result_c = cp.zeros((4, out_h, out_w), dtype=cp.uint8)
+    
+    for i in range(4):
+        ndimage.map_coordinates(
+            texture_c[i],
+            coordinates,
+            output=result_c[i],
+            order=1, # Bilinear
+            mode='constant',
+            cval=0,
+            prefilter=False
+        )
+        
+    return cp.transpose(result_c, (1, 2, 0)) # Return (H, W, 4)
+
+def _sample_wms_layer_gpu_approx(
+    wms_texture: cp.ndarray,
+    ortho_crs,
+    center_e: float,
+    center_n: float,
+    heading: float,
+    m_per_px: float,
+    out_h: int,
+    out_w: int,
+    wms_zoom: int,
+    wms_bounds_px: Tuple[float, float]
+) -> cp.ndarray:
+    """
+    BLAZING FAST WMS SAMPLER using Affine Approximation.
+    Instead of calculating pyproj per pixel (millions of ops on CPU),
+    we calculate it for 4 corners and derive an affine matrix for GPU.
+    """
+    rad = math.radians(-heading) # Consistency with ortho
+    cos_h = math.cos(rad)
+    sin_h = math.sin(rad)
+    
+    # 1. Define 4 corners of the output view (relative to center pixels)
+    # TopLeft, TopRight, BottomRight, BottomLeft
+    corners_px = [
+        (-out_w/2, -out_h/2),
+        (out_w/2, -out_h/2),
+        (out_w/2, out_h/2),
+        (-out_w/2, out_h/2)
+    ]
+    
+    # 2. Calculate their Geo Coordinates (E, N)
+    geo_pts = []
+    for px_x, px_y in corners_px:
+        geo_dx = px_x * m_per_px
+        geo_dy = -px_y * m_per_px
+        ge = center_e + geo_dx * cos_h - geo_dy * sin_h
+        gn = center_n + geo_dx * sin_h + geo_dy * cos_h
+        geo_pts.append((ge, gn))
+        
+    # 3. Transform to WMS Pixels on CPU (Only 4 points! Fast!)
+    e_cpu = np.array([p[0] for p in geo_pts])
+    n_cpu = np.array([p[1] for p in geo_pts])
+    
+    # Initialize transformer (cached implicitly if called often, or cheap enough)
+    # Using 'always_xy=True' ensures lon, lat order
+    from_crs = CRS.from_user_input(ortho_crs)
+    to_crs = CRS("EPSG:4326")
+    transformer = Transformer.from_crs(from_crs, to_crs, always_xy=True)
+    
+    lons, lats = transformer.transform(e_cpu, n_cpu)
+    
+    # Convert to WMS Pixels
+    n_z = 2.0 ** wms_zoom
+    wms_pts = []
+    
+    for i in range(4):
+        lat = lats[i]
+        lon = lons[i]
+        # Web Mercator Projection
+        x_px = (lon + 180.0) / 360.0 * n_z * 256.0
+        lat_rad = math.radians(lat)
+        val = math.tan(math.pi / 4.0 + lat_rad / 2.0)
+        y_px = (1.0 - math.log(val) / math.pi) / 2.0 * n_z * 256.0
+        
+        # Adjust by WMS texture offset
+        wms_ox, wms_oy = wms_bounds_px
+        src_x = x_px - wms_ox
+        src_y = y_px - wms_oy
+        wms_pts.append((src_x, src_y))
+        
+    # 4. Derive Affine Matrix mapping Output(x, y) -> WMS(u, v)
+    # We solve for M such that: [u, v, 1] = M @ [x, y, 1]
+    # Since it's an approximation, we can use OpenCV's getAffineTransform or just linear fit
+    # We use a simple 3-point solver (TL, TR, BL sufficient for affine)
+    # Output Coords (0,0 is Top Left in image space):
+    # (0, 0) -> wms_pts[0]
+    # (w, 0) -> wms_pts[1]
+    # (0, h) -> wms_pts[3]
+    
+    src_tri = np.array([[0, 0], [out_w, 0], [0, out_h]], dtype=np.float32)
+    dst_tri = np.array([wms_pts[0], wms_pts[1], wms_pts[3]], dtype=np.float32)
+    
+    # Compute Matrix: src -> dst
+    # cv2.getAffineTransform equivalent
+    # M = dst * src_inv ? No.
+    # We want: InputCoord = M @ OutputCoord
+    # Wait, ndimage.affine_transform applies Inverse Mapping: Output -> Input
+    # So we want matrix M that maps Output(r, c) -> Input(r, c) (WMS y, x)
+    # The Matrix M derived above maps Output(x,y) to Input(x,y).
+    
+    # Let's compute it manually to be safe without cv2
+    # x' = a*x + b*y + c
+    # y' = d*x + e*y + f
+    # Using 0,0 -> x0, y0
+    # c = x0, f = y0
+    # Using w,0 -> x1, y1
+    # a*w + c = x1 => a = (x1 - x0) / w
+    # d*w + f = y1 => d = (y1 - y0) / w
+    # Using 0,h -> x2, y2
+    # b*h + c = x2 => b = (x2 - x0) / h
+    # e*h + f = y2 => e = (y2 - y0) / h
+    
+    x0, y0 = wms_pts[0] # TL
+    x1, y1 = wms_pts[1] # TR
+    x2, y2 = wms_pts[3] # BL
+    
+    c_off = x0
+    f_off = y0
+    a_coeff = (x1 - x0) / out_w
+    d_coeff = (y1 - y0) / out_w
+    b_coeff = (x2 - x0) / out_h
+    e_coeff = (y2 - y0) / out_h
+    
+    # Matrix for ndimage: [[row_r, row_c], [col_r, col_c]]
+    # Output coords are (row, col) i.e. (y, x)
+    # Input coords desired (y', x')
+    # y' (row) = d*x + e*y + f = d*col + e*row + f
+    # x' (col) = a*x + b*y + c = a*col + b*row + c
+    
+    # So:
+    # row_in = e_coeff * row_out + d_coeff * col_out + f_off
+    # col_in = b_coeff * row_out + a_coeff * col_out + c_off
+    
+    matrix = cp.array([[e_coeff, d_coeff], [b_coeff, a_coeff]], dtype=cp.float64)
+    offset = cp.array([f_off, c_off], dtype=cp.float64)
+    
+    # 5. Apply Affine Transform on GPU
+    wms_c = wms_texture
+    if wms_texture.shape[2] == 4:
+         wms_c = cp.transpose(wms_texture, (2, 0, 1))
+         
+    result_c = cp.zeros((4, out_h, out_w), dtype=cp.uint8)
+    
+    for i in range(4):
+        if i < wms_c.shape[0]:
+             chan = wms_c[i]
+        else:
+            chan = cp.full((wms_c.shape[1], wms_c.shape[2]), 255, dtype=cp.uint8)
+            
+        ndimage.affine_transform(
+            chan,
+            matrix,
+            offset=offset,
+            output_shape=(out_h, out_w),
+            output=result_c[i],
+            order=1,
+            mode='constant',
+            cval=0,
+            prefilter=False
+        )
+        
+    return cp.transpose(result_c, (1, 2, 0))
+
+
 class GPURenderContext:
-    """
-    STRONG GPU CONTEXT:
-    Manages Ortho, WMS, and Vector layers as cached GPU textures.
-    Ensures zero-jitter by sharing coordinate systems.
-    """
     def __init__(self):
-        self.ortho_texture = None # (RGBA) GPU array
+        self.ortho_texture = None # (H, W, 4) GPU array
         self.ortho_transform = None
         self.ortho_crs = None
-        self.ortho_nodata = None
         
-        # New: Baked Vector Layer on GPU
-        self.vector_texture = None # (RGBA) GPU array
-        self.has_vectors = False
+        self.vector_texture = None 
         
-        self.wms_texture = None # (RGBA) GPU array
+        self.wms_texture = None 
         self.wms_bounds_px = None 
         self.wms_zoom = None
         
-        # New: Cached Icon Texture
-        self.icon_texture = None # (RGBA, small)
-        self.cone_texture = None # (RGBA, small)
+        self.icon_texture = None
         
-        self.last_config_key = None
+        self.cpu_ortho = None 
+        self.cpu_ortho_tf = None
+        self.ortho_w = 0
+        self.ortho_h = 0
+        
         self.is_ready = False
 
     def clear(self):
-        """Free GPU memory and reset context."""
         self.ortho_texture = None
         self.vector_texture = None
         self.wms_texture = None
         self.icon_texture = None
-        self.cone_texture = None
+        self.cpu_ortho = None
         self.is_ready = False
         if HAS_GPU:
             try:
                 mempool = cp.get_default_memory_pool()
-                pinned_mempool = cp.get_default_pinned_memory_pool()
                 mempool.free_all_blocks()
-                pinned_mempool.free_all_blocks()
-                print("[GPU] Context cleared and memory freed.")
-            except Exception as e:
-                print(f"[GPU] Error clearing memory: {e}")
+            except: pass
 
     def preload(self, dataset, center_points, margin_m, vectors=None, arrow_size=100, cone_len=200, wms_source="google_hybrid"):
-        """
-        Loads Ortho, Vectors, and WMS into GPU memory.
-        """
         if not HAS_GPU: return False
         
-        print("[GPU] Starting Heavy Preload (99% Mode)...")
-        
-        # --- 1. Bounds Calculation ---
         es = [p[0] for p in center_points]
         ns = [p[1] for p in center_points]
         xmin, xmax = min(es) - margin_m, max(es) + margin_m
         ymin, ymax = min(ns) - margin_m, max(ns) + margin_m
         
-        # --- 2. Load Ortho (High Res) ---
+        # Load Ortho 
         window = from_bounds(xmin, ymin, xmax, ymax, dataset.transform)
+        target_res = dataset.res[0] # Prefer native
         
-        # Optimize size for GPU memory (aim for ~4GB usage max or 95% of available)
-        free_mem, _ = cp.cuda.runtime.memGetInfo()
-        # Reserve 1GB for overhead, use rest for textures
-        avail_mem = max(free_mem - 1024*1024*1024, 1024*1024*512)
+        tw = int(window.width)
+        th = int(window.height)
         
-        # Calculate max dimension
-        # 4 channels * 1 byte (uint8) = 4 bytes/pixel 
-        # (We load as uint8 directly to save space, assuming normalize on CPU or block-wise)
-        max_pixels = avail_mem / 8 # Factor of safety for mips/vars
-        side = int(math.sqrt(max_pixels))
-        side = min(side, 16384) # Cap at 16k texture
+        # Aggressive VRAM usage but safe caps
+        MAX_DIM = 16384
+        if tw > MAX_DIM or th > MAX_DIM:
+            scale = MAX_DIM / max(tw, th)
+            tw = int(tw * scale)
+            th = int(th * scale)
         
-        w_m = xmax - xmin
-        h_m = ymax - ymin
-        ratio = w_m / h_m
-        if ratio > 1:
-            tw, th = side, int(side / ratio)
-        else:
-            tw, th = int(side * ratio), side
-            
-        print(f"[GPU] Allocating Textures: {tw}x{th} (~{tw*th*4/1024/1024:.0f} MB each)")
-
-        # Read Ortho
-        # Read as byte directly if possible to save RAM? rasterio reads as type. 
-        # reading boundless with fill_value
+        print(f"[GPU] Loading Ortho {tw}x{th}...")
+        
         cpu_data = dataset.read(
             window=window,
             out_shape=(dataset.count, th, tw),
@@ -166,80 +357,48 @@ class GPURenderContext:
             fill_value=dataset.nodata
         )
         
-        # Store transform
-        base_transform = rasterio.windows.transform(window, dataset.transform)
-        scale_x = window.width / tw
-        scale_y = window.height / th
-        self.ortho_transform = base_transform * Affine.scale(scale_x, scale_y)
+        rgb, alpha = _to_rgba(cpu_data, nodata_val=dataset.nodata)
+        normalized = _normalize_rgba(rgb, alpha)
+        
+        self.cpu_ortho_tf = rasterio.windows.transform(window, dataset.transform) * Affine.scale(window.width/tw, window.height/th)
         self.ortho_crs = dataset.crs
+        self.ortho_w = tw
+        self.ortho_h = th
         
-        # Upload Ortho
-        self.ortho_texture = _normalize_gpu_rgba(cp.asarray(cpu_data), dataset.nodata)
-        del cpu_data # Free RAM
+        self.ortho_texture = cp.asarray(normalized)
         
-        # --- 3. Bake Vectors (Zero Jitter) ---
+        # Bake Vectors
+        print(f"[GPU] Baking Vectors...")
+        vec_img = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(vec_img)
+        
+        inv_tf = ~self.cpu_ortho_tf
+        def vec_tf(e, n):
+            c, r = inv_tf * (e, n)
+            return c, r
+            
         if vectors:
-            print("[GPU] Baking Vectors to Texture...")
-            # We use PIL to draw vectors onto a transparent image of SAME SIZE as Ortho
-            # This guarantees perfect alignment.
-            vec_img = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(vec_img)
-            
-            # Helper: Geo -> Pixel (in this specific texture)
-            # Texture Coord T = ~Transform * Geo
-            inv_tf = ~self.ortho_transform
-            
-            def gpu_vec_transform(e, n):
-                # Apply inverse transform
-                # x = (e - c) / a ... simplified by Affine logic
-                c, r = inv_tf * (e, n)
-                return c, r
-
             for geom_iter, color, width, pattern in vectors:
-                # Scale width slightly because we might zoom in/out
-                # But here we bake at fixed resolution. 
-                # If we zoom in 2x, this line will look 2x thicker. 
-                # This is acceptable for stability.
-                # Or we can draw slightly thicker lines.
-                eff_width = max(1, int(width * (tw / window.width) * 2)) # Heuristic
-                
+                eff_width = max(1, int(width * 1.5)) 
                 for geom in geom_iter:
-                    _draw_geometry_precise(draw, geom, gpu_vec_transform, color, eff_width, pattern)
-            
-            # Upload Vectors
-            self.vector_texture = cp.asarray(np.array(vec_img))
-            self.has_vectors = True
-            
-        # --- 4. WMS Background ---
-        # Same Logic as before but simplified
+                    _draw_geometry_precise(draw, geom, vec_tf, color, eff_width, pattern)
+        
+        self.vector_texture = cp.asarray(np.array(vec_img))
+        
+        # WMS
         w_geo, s_geo, e_geo, n_geo = transform_bounds(dataset.crs, "EPSG:4326", xmin, ymin, xmax, ymax)
-        
-        # Smart Zoom Selection
         span_deg = max(e_geo - w_geo, n_geo - s_geo)
-        # 16k pixels for span_deg
-        # 360 deg = 256 * 2^z pixels
-        # 2^z = (pixels * 360) / (256 * span)
-        if span_deg > 0:
-            ideal_z = math.log2((max(tw,th) * 360) / (256 * span_deg))
-            wms_zoom = min(19, max(10, int(ideal_z)))
-        else:
-            wms_zoom = 18
-            
-        print(f"[GPU] Fetching WMS Level {wms_zoom} (Source: {wms_source})...")
+        wms_zoom = min(19, max(12, int(math.log2((4096 * 360) / (256 * span_deg)))))
+        
+        print(f"[GPU] Fetching WMS Zoom {wms_zoom}...")
         ret_wms = _fetch_wms_mosaic_for_bounds(w_geo, s_geo, e_geo, n_geo, wms_zoom, source=wms_source)
-        wms_img = ret_wms[0]
-        wms_info = ret_wms[1]
-        
-        if len(wms_info) >= 2:
-            self.wms_bounds_px = (wms_info[0], wms_info[1])
+        if ret_wms[0]:
+            self.wms_texture = cp.asarray(np.array(ret_wms[0].convert("RGBA")))
+            self.wms_bounds_px = ret_wms[1]
             self.wms_zoom = wms_zoom
-            # Ensure 4 channels
-            self.wms_texture = cp.asarray(np.array(wms_img.convert("RGBA")))
-        
-        # --- 5. Bake Icons ---
-        # Generate Icon Texture
-        # We assume standard arrow
-        icon_sz = int(arrow_size * 1.5)
+            
+        # Icons
+        icon_sz = 256
         ic_img = Image.new("RGBA", (icon_sz, icon_sz), (0,0,0,0))
         _draw_center_icon(ic_img, (icon_sz//2, icon_sz//2), arrow_size, 0.4, arrow_size//3, 0)
         self.icon_texture = cp.asarray(np.array(ic_img))
@@ -248,122 +407,6 @@ class GPURenderContext:
         return True
 
 _CONTEXT = GPURenderContext()
-
-def _normalize_gpu_rgba(arr_gpu, nodata=None):
-    """Normalize and convert to (H, W, 4) uint8"""
-    c, h, w = arr_gpu.shape
-    if c >= 3:
-        rgb = arr_gpu[:3]
-    else:
-        rgb = cp.repeat(arr_gpu[0][None, ...], 3, axis=0) # Grey->RGB
-
-    # Alpha
-    if c == 4:
-        alpha = arr_gpu[3]
-    elif nodata is not None:
-        if cp.isnan(float(nodata)):
-            mask = ~cp.isnan(arr_gpu[0])
-        else:
-            mask = arr_gpu[0] != nodata
-        alpha = (mask.astype(cp.uint8) * 255)
-    else:
-        alpha = cp.full((h, w), 255, dtype=cp.uint8)
-
-    # Normalize RGB (Simple MinMax)
-    rgb_f = rgb.astype(cp.float32)
-    # Fast approach: use global min/max or static
-    # Using 2%-98% on GPU
-    v_min = 0 # cp.percentile(rgb_f, 2) # Percentile is slow?
-    v_max = 255 # cp.percentile(rgb_f, 98)
-    
-    # Let's trust standard byte range for speed unless it looks weird
-    # If 16-bit or float, we MUST normalize
-    if arr_gpu.dtype != cp.uint8:
-         v_min = float(cp.min(rgb_f))
-         v_max = float(cp.max(rgb_f))
-         if v_max > v_min:
-             rgb_u8 = ((rgb_f - v_min) / (v_max - v_min) * 255).astype(cp.uint8)
-         else:
-             rgb_u8 = cp.zeros_like(rgb, dtype=cp.uint8)
-    else:
-         rgb_u8 = rgb
-
-    return cp.dstack((rgb_u8[0], rgb_u8[1], rgb_u8[2], alpha))
-
-def _affine_sample(texture, matrix, offset, out_h, out_w):
-    """
-    Core GPU sampler.
-    texture: (H, W, 4)
-    matrix: 2x2 [[m00, m01], [m10, m11]]
-    offset: [oy, ox]
-    """
-    # Prepare output
-    output = cp.zeros((out_h, out_w, 4), dtype=cp.uint8)
-    
-    # Transpose for affine function: (H, W, C) -> (C, H, W)
-    tex_c = cp.transpose(texture, (2, 0, 1))
-    
-    # Split channels to avoid 4D affine (cupyx limitation)
-    for i in range(4):
-        ndimage.affine_transform(
-            tex_c[i],
-            matrix,
-            offset=offset,
-            output_shape=(out_h, out_w),
-            output=output[:, :, i], # Write direct to channel
-            order=1, # Bilinear
-            mode='constant',
-            cval=0,
-            prefilter=False # Faster
-        )
-    return output
-
-def _blit_icon(bg_arr, icon_arr, x, y, angle_deg):
-    """
-    Blits rotated icon onto bg_arr (H,W,4).
-    This is a naive GPU implementation.
-    """
-    # For speed, we just rotate the icon on CPU via PIL if it's small? 
-    # No, we promised 99% GPU.
-    # But rotating a 100x100 patch on GPU is easy.
-    
-    ih, iw, _ = icon_arr.shape
-    bh, bw, _ = bg_arr.shape
-    
-    # Rotate Icon
-    # Angle needs to be negative for image coord system
-    # We can use ndimage.rotate
-    icon_rot = ndimage.rotate(icon_arr, angle_deg, axes=(0,1), reshape=True, order=1, prefilter=False)
-    rh, rw, _ = icon_rot.shape
-    
-    # Coords
-    lx = int(x - rw//2)
-    ty = int(y - rh//2)
-    
-    # Clip
-    sx, sy = 0, 0
-    ex, ey = rw, rh
-    
-    if lx < 0: sx = -lx; lx = 0
-    if ty < 0: sy = -ty; ty = 0
-    if lx + (ex-sx) > bw: ex -= (lx + (ex-sx)) - bw
-    if ty + (ey-sy) > bh: ey -= (ty + (ey-sy)) - bh
-    
-    if ex <= sx or ey <= sy: return bg_arr
-    
-    # Alpha Blend Patch
-    patch_bg = bg_arr[ty:ty+(ey-sy), lx:lx+(ex-sx)].astype(cp.float32)
-    patch_ic = icon_rot[sy:ey, sx:ex].astype(cp.float32)
-    
-    alpha = patch_ic[:,:,3:4] / 255.0
-    
-    out_patch = patch_ic[:,:,:3] * alpha + patch_bg[:,:,:3] * (1.0 - alpha)
-    out_alpha = cp.maximum(patch_bg[:,:,3], patch_ic[:,:,3]) # Simple max alpha
-    
-    bg_arr[ty:ty+(ey-sy), lx:lx+(ex-sx), :3] = out_patch.astype(cp.uint8)
-    bg_arr[ty:ty+(ey-sy), lx:lx+(ex-sx), 3] = out_alpha.astype(cp.uint8)
-    
-    return bg_arr
 
 def render_frame_gpu(
     dataset: rasterio.io.DatasetReader,
@@ -380,211 +423,99 @@ def render_frame_gpu(
     cone_opacity: float,
     icon_circle_opacity: float,
     icon_circle_size_px: int,
+    show_compass: bool = True,
     compass_size_px: int = 40,
-    use_context: bool = True,
     wms_source: str = "google_hybrid",
 ) -> Image.Image:
     
     if not HAS_GPU:
         raise RuntimeError("GPU acceleration requested but CuPy is not available.")
 
-    # Matrix Setup
-    # Target: Output grid (width, height) centered at center_e, center_n
-    # Meters per pixel
-    m_per_px_out = (map_half_width_m * 2.0) / width
+    ss_factor = 2
+    sw, sh = width * ss_factor, height * ss_factor
+    m_per_px = (map_half_width_m * 2.0) / width / ss_factor
     
-    # Rotation Angle (-heading)
-    theta = math.radians(-heading)
-    c, s = math.cos(theta), math.sin(theta)
+    final_gpu = None
     
-    # Common Matrix Calculation Helper
-    def get_affine_params(tex_transform, tex_w, tex_h, m_per_px_tex):
-        # Scale
-        scale = m_per_px_out / m_per_px_tex
-        
-        # Matrix M = S * R
-        # [[Sc -Ss], [Ss Sc]] ? No, Inverse mapping.
-        # We want Input = M * Output + Offset
-        # Input (x,y) is Texture Px. Output is Screen Px.
-        
-        # M maps Output (rotated) -> Input (aligned)
-        # R_inv maps Output -> Unrotated Frame
-        # S_inv maps Unrotated Frame -> Texture Px
-        
-        # R (Output -> GeoDelta) = [[cos, sin], [-sin, cos]] * scale
-        # Actually it's easier to build the matrix:
-        # x_src = m00*y_out + m01*x_out + off_x
-        # y_src = m10*y_out + m11*x_out + off_y
-        
-        m00 = scale * c
-        m01 = scale * s
-        m10 = -scale * s
-        m11 = scale * c
-        
-        matrix = cp.array([[m00, m01], [m10, m11]])
-        
-        # Offset
-        # Center of Output (h/2, w/2) maps to Center of Input (cx, cy)
-        # cx, cy = Input pixel coord of (center_e, center_n)
-        
-        if tex_transform:
-            # Ortho
-            # ~tex_transform * (e, n)
-            inv = ~tex_transform
-            cx, cy = inv * (center_e, center_n)
-        else:
-            # WMS (Global Pixel space reference)
-            # Need to handle WMS offset per function call
-            cx, cy = 0, 0 
-
-        # offset = center_in - M @ center_out
-        oc_y, oc_x = height/2.0, width/2.0
-        
-        moy = m00 * oc_y + m01 * oc_x
-        mox = m10 * oc_y + m11 * oc_x
-        
-        off_y = cy - moy
-        off_x = cx - mox
-        
-        return matrix, [off_y, off_x]
-
-    # --- Render Layers ---
-    layers = []
-    
-    # 1. Ortho & Vectors (Share Transform)
     if _CONTEXT.is_ready and _CONTEXT.ortho_texture is not None:
-        # m per px of ortho
-        m_px = abs(_CONTEXT.ortho_transform.a)
-        mtx, off = get_affine_params(_CONTEXT.ortho_transform, 0, 0, m_px)
+        ortho_layer = _sample_using_inverse_transform(
+            texture=_CONTEXT.ortho_texture,
+            center_e=center_e,
+            center_n=center_n,
+            heading=heading,
+            m_per_px=m_per_px,
+            out_h=sh,
+            out_w=sw,
+            ortho_transform=_CONTEXT.cpu_ortho_tf
+        )
         
-        # Sample Ortho
-        ortho_layer = _affine_sample(_CONTEXT.ortho_texture, mtx, off, height, width)
-        layers.append(ortho_layer)
-        
-        # Sample Vectors (Exact same matrix/offset)
-        if _CONTEXT.has_vectors and _CONTEXT.vector_texture is not None:
-             vec_layer = _affine_sample(_CONTEXT.vector_texture, mtx, off, height, width)
-             # Blend Vectors atop Ortho immediately? Or add to stack? 
-             # Let's blend immediately to save memory
-             # alpha blend
-             alpha = vec_layer[:,:,3:4].astype(cp.float32) / 255.0
-             ortho_layer[:,:,:3] = vec_layer[:,:,:3] * alpha + ortho_layer[:,:,:3] * (1.0 - alpha)
-             # Max alpha? No, keep ortho alpha (usually 255)
-             
+        if _CONTEXT.vector_texture is not None:
+             vec_layer = _sample_using_inverse_transform(
+                texture=_CONTEXT.vector_texture,
+                center_e=center_e,
+                center_n=center_n,
+                heading=heading,
+                m_per_px=m_per_px,
+                out_h=sh,
+                out_w=sw,
+                ortho_transform=_CONTEXT.cpu_ortho_tf
+            )
+             v_alpha = vec_layer[:,:,3:4].astype(cp.float32) / 255.0
+             ortho_layer[:,:,:3] = (vec_layer[:,:,:3] * v_alpha + ortho_layer[:,:,:3] * (1.0 - v_alpha)).astype(cp.uint8)
+             ortho_layer[:,:,3] = cp.maximum(ortho_layer[:,:,3], vec_layer[:,:,3])
     else:
-        # Fallback empty
-        layers.append(cp.zeros((height, width, 4), dtype=cp.uint8))
-
-    # 2. WMS
+        ortho_layer = cp.zeros((sh, sw, 4), dtype=cp.uint8)
+        
     if _CONTEXT.is_ready and _CONTEXT.wms_texture is not None:
-        # Calculate WMS specific params
-        # Center Lat/Lon
-        clon, clat = transform(dataset.crs, "EPSG:4326", [center_e], [center_n])
-        clon, clat = clon[0], clat[0]
+        # Use APX (Approximation) for Speed
+        wms_layer = _sample_wms_layer_gpu_approx(
+            wms_texture=_CONTEXT.wms_texture,
+            ortho_crs=_CONTEXT.ortho_crs,
+            center_e=center_e,
+            center_n=center_n,
+            heading=heading,
+            m_per_px=m_per_px,
+            out_h=sh,
+            out_w=sw,
+            wms_zoom=_CONTEXT.wms_zoom,
+            wms_bounds_px=_CONTEXT.wms_bounds_px
+        )
         
-        # WMS Resolution at this Lat
-        res_wms = (math.cos(math.radians(clat)) * 2 * math.pi * 6378137) / (256 * 2**_CONTEXT.wms_zoom)
-        
-        # Center Pixel in WMS texture
-        # Global px
-        gpx, gpy = _latlon_to_pixel(_clamp_latlon(clat, -85, 85), clon, _CONTEXT.wms_zoom)
-        # Local px
-        wms_ox, wms_oy = _CONTEXT.wms_bounds_px
-        cx, cy = gpx - wms_ox, gpy - wms_oy
-        
-        # Matrix
-        scale = m_per_px_out / res_wms
-        m00 = scale * c
-        m01 = scale * s
-        m10 = -scale * s
-        m11 = scale * c
-        matrix = cp.array([[m00, m01], [m10, m11]])
-        
-        oc_y, oc_x = height/2.0, width/2.0
-        moy = m00 * oc_y + m01 * oc_x
-        mox = m10 * oc_y + m11 * oc_x
-        
-        off_y = cy - moy
-        off_x = cx - mox
-        
-        wms_layer = _affine_sample(_CONTEXT.wms_texture, matrix, [off_y, off_x], height, width)
-        
-        # Blend (WMS is background)
-        # Final = Ortho over WMS
-        top = layers[0]
-        bot = wms_layer
-        
-        alpha = top[:,:,3:4].astype(cp.float32) / 255.0
-        out_rgb = top[:,:,:3].astype(cp.float32) * alpha + bot[:,:,:3].astype(cp.float32) * (1.0 - alpha)
-        
-        final_gpu = cp.dstack((out_rgb, cp.full((height, width, 1), 255, dtype=cp.float32))).astype(cp.uint8)
-        
+        o_alpha = ortho_layer[:,:,3:4].astype(cp.float32) / 255.0
+        final_rgb = (ortho_layer[:,:,:3] * o_alpha + wms_layer[:,:,:3] * (1.0 - o_alpha)).astype(cp.uint8)
+        final_gpu = cp.dstack((final_rgb, cp.full((sh, sw, 1), 255, dtype=cp.uint8)))
     else:
-        final_gpu = layers[0]
+        final_gpu = ortho_layer
 
-    # --- 3. Icons / HUD (GPU Blit) ---
-    # We blit the arrow icon in the center (static position, rotated icon)
-    # Actually, the icon is always center screen facing UP relative to map flow?
-    # No, standard is: Map rotates, Icon stays UP? Or Map Fixed, Icon Rotates?
-    # The code rotates the map by -heading. So the map is "Heading Up".
-    # Therefore, the Icon should point UP (0 deg rotation relative to screen).
-    # Wait, existing code passes `heading` to map rotation. 
-    # Validated: If map rotates by -heading, the "Forward" direction is UP. 
-    # So the icon should be drawn pointing UP.
-    
-    # Draw simple triangle/arrow on GPU directly?
-    # Or blit the texture we made in preload.
-    # If we blit, we just copy it to center.
+    final_f = final_gpu.astype(cp.float32)
+    final_out = (final_f[0::2, 0::2] + final_f[1::2, 0::2] + final_f[0::2, 1::2] + final_f[1::2, 1::2]) / 4.0
+    final_gpu_out = final_out.astype(cp.uint8)
+
     if _CONTEXT.icon_texture is not None:
-        # Blit center
         ih, iw, _ = _CONTEXT.icon_texture.shape
-        cx, cy = width//2, height//2
-        # Simple overlay
-        # Alpha blend
-        ic = _CONTEXT.icon_texture
-        start_y = cy - ih//2
-        start_x = cx - iw//2
-        
-        # simplistic bound check
-        if start_y >= 0 and start_x >= 0 and start_y+ih < height and start_x+iw < width:
-             patch_bg = final_gpu[start_y:start_y+ih, start_x:start_x+iw].astype(cp.float32)
-             patch_ic = ic.astype(cp.float32)
-             alpha = patch_ic[:,:,3:4] / 255.0 * icon_circle_opacity # Apply opacity
-             
-             # If icon texture is white, colorize? 
-             # Assuming texture is pre-colored.
-             out = patch_ic[:,:,:3] * alpha + patch_bg[:,:,:3] * (1.0 - alpha)
-             final_gpu[start_y:start_y+ih, start_x:start_x+iw, :3] = out.astype(cp.uint8)
+        scy, scx = height//2, width//2
+        sy, sx = scy - ih//2, scx - iw//2
+        if sy >= 0 and sx >= 0 and sy+ih < height and sx+iw < width:
+             patch = final_gpu_out[sy:sy+ih, sx:sx+iw].astype(cp.float32)
+             ic = _CONTEXT.icon_texture.astype(cp.float32)
+             alpha = (ic[:,:,3:4] / 255.0) * icon_circle_opacity
+             res = ic[:,:,:3] * alpha + patch[:,:,:3] * (1.0 - alpha)
+             final_gpu_out[sy:sy+ih, sx:sx+iw, :3] = res.astype(cp.uint8)
 
-    # --- 4. Compass (CPU Fallback for now, or simple blit) ---
-    # Compass is static in corner. Easy to blit if we had texture.
-    # Leaving for CPU post-process to ensure quality text rendering.
-
-    # --- Download ---
-    final_arr = cp.asnumpy(final_gpu)
-    img = Image.fromarray(final_arr, "RGBA")
+    result = Image.fromarray(cp.asnumpy(final_gpu_out), "RGBA")
     
-    # Draw Compass (CPU is fine, it's just UI)
     if show_compass:
         c_pos = (width - compass_size_px - 10, compass_size_px + 10)
-        # Note: Compass usually points North. Map is Heading Up.
-        # So North is at -Heading degrees relative to Up.
-        _draw_compass(img, c_pos, compass_size_px, -heading)
-
-    return img
+        _draw_compass(result, c_pos, compass_size_px, -heading)
+        
+    return result
 
 def preload_track_gpu(config: Any, jobs: List[Tuple]) -> None:
-    """
-    Wrapper to preload all resources into GPURenderContext.
-    Called from app.py before the render loop.
-    """
     if not HAS_GPU: return
     
     centers = [(j[1], j[2]) for j in jobs]
     
-    # Open dataset momentarily to read data
     with rasterio.open(config.ortho_path) as dataset:
-        # Load Vectors for baking
         vectors = load_vectors(
             dataset.crs,
             [layer.model_dump() for layer in config.vector_layers],
@@ -597,9 +528,8 @@ def preload_track_gpu(config: Any, jobs: List[Tuple]) -> None:
             config.point_color,
         )
         
-        # Preload
-        margin = config.map_half_width_m * 3.0 
-        
+        margin = config.map_half_width_m * 2.5
+        _CONTEXT.clear()
         _CONTEXT.preload(
             dataset=dataset,
             center_points=centers,
@@ -610,3 +540,7 @@ def preload_track_gpu(config: Any, jobs: List[Tuple]) -> None:
             wms_source=config.wms_source
         )
 
+def cleanup_gpu():
+    """Interface for app.py"""
+    if _CONTEXT:
+        _CONTEXT.clear()

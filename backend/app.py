@@ -201,14 +201,20 @@ def _dispatch_render(cfg: RenderConfig, dataset: rasterio.io.DatasetReader, vect
         "wms_source": cfg.wms_source,
     }
 
-    if cfg.use_gpu and GPU_RENDER_AVAILABLE:
+    if cfg.use_gpu:
+        if not GPU_RENDER_AVAILABLE:
+            err_msg = "[GPU] Error: GPU rendering requested but backend is not available. Stopping."
+            if job_id: _update_job(job_id, status="failed", message=err_msg, log=err_msg)
+            raise RuntimeError(err_msg)
+            
         try:
             return render_frame_gpu(**render_params)
         except Exception as e:
-            err_msg = f"[GPU] Error rendering {'preview' if frame_idx is None else f'frame {frame_idx}'}: {e}. Falling back to CPU."
+            err_msg = f"[GPU] Error rendering {'preview' if frame_idx is None else f'frame {frame_idx}'}: {e}. Process stopped as requested."
             print(err_msg)
             if job_id:
-                _update_job(job_id, log=err_msg)
+                _update_job(job_id, status="failed", message=err_msg, log=err_msg)
+            raise RuntimeError(err_msg)
     
     # Default/Fallback to CPU
     return render_frame(**render_params)
@@ -837,10 +843,9 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                     _update_job(job_id, log="Optimizando texturas en GPU para máxima velocidad...")
                     preload_track_gpu(config, jobs)
                 except Exception as e:
-                    _update_job(job_id, log=f"Aviso: Falló precarga GPU ({e}). Cambiando a renderizado CPU multicore.")
-                    config.use_gpu = False
-                    # Recalculate workers for CPU mode
-                    workers = config.workers if config.workers > 0 else max(1, (os.cpu_count() or 2) - 1)
+                    err_msg = f"[GPU] Error crítico en precarga: {e}. El proceso se detiene por seguridad."
+                    _update_job(job_id, status="failed", message=err_msg, log=err_msg)
+                    raise RuntimeError(err_msg)
 
             with rasterio.open(config.ortho_path) as dataset:
                 vectors = load_vectors(
