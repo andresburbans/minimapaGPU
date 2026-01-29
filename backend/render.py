@@ -293,6 +293,7 @@ def render_frame(
     icon_circle_size_px: int,
     show_compass: bool = True,
     compass_size_px: int = 40,
+    wms_source: str = "google_hybrid",
 ) -> Image.Image:
     """Render a single minimap frame.
     
@@ -360,10 +361,10 @@ def render_frame(
         else:
             zoom = 18
             
-        print(f"[WMS] CPU Mode Adaptive Zoom: {zoom} (Span: {span_deg:.6f} deg)")
-        mosaic, (m_l, m_t) = _fetch_wms_mosaic_for_bounds(w_geo, s_geo, e_geo, n_geo, zoom)
+        print(f"[WMS] Render Loop Zoom: {zoom} (Span: {span_deg:.6f} deg, Source: {wms_source})")
+        mosaic, (m_l, m_t) = _fetch_wms_mosaic_for_bounds(w_geo, s_geo, e_geo, n_geo, zoom, source=wms_source)
         
-        if mosaic:
+        if mosaic and mosaic.size != (1,1):
             # 3. Create Source Transform (EPSG:3857 - Web Mercator)
             # Web Mercator resolution at zoom 19
             res_3857 = 40075016.686 / (256 * (2 ** zoom))
@@ -741,21 +742,44 @@ def _pixel_to_latlon(x: float, y: float, zoom: int) -> Tuple[float, float]:
     return lat_deg, lon_deg
 
 
-@functools.lru_cache(maxsize=1000)
-def _fetch_tile(x: int, y: int, z: int):
-    # Intentar descargar tile satelital
-    url = f"https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}"
+def _xyz_to_quadkey(x: int, y: int, z: int) -> str:
+    """Converts XYZ tile coordinates to a Bing Maps QuadKey."""
+    quadkey = ""
+    for i in range(z, 0, -1):
+        digit = 0
+        mask = 1 << (i - 1)
+        if (x & mask) != 0:
+            digit += 1
+        if (y & mask) != 0:
+            digit += 2
+        quadkey += str(digit)
+    return quadkey
+
+
+@functools.lru_cache(maxsize=2000)
+def _fetch_tile(x: int, y: int, z: int, source: str = "google_hybrid"):
+    # Define sources
+    sources = {
+        "google_hybrid": f"https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+        "google_satellite": f"http://www.google.cn/maps/vt?lyrs=s@189&gl=cn&x={x}&y={y}&z={z}",
+        "esri_satellite": f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        "bing_satellite": f"http://ecn.t3.tiles.virtualearth.net/tiles/a{_xyz_to_quadkey(x, y, z)}.jpeg?g=0"
+    }
+    
+    url = sources.get(source, sources["google_hybrid"])
+    
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "MinimapaGPT/1.0"})
-        with urllib.request.urlopen(req, timeout=4) as resp:
+        with urllib.request.urlopen(req, timeout=6) as resp:
             data = resp.read()
         return Image.open(io.BytesIO(data)).convert("RGB")
-    except Exception:
+    except Exception as ex:
         # Retornar tile negro/vacío si falla
+        # print(f"[WMS] Tile Fetch Error ({source}, x={x},y={y},z={z}): {ex}")
         return Image.new("RGB", (256, 256), (20, 20, 20))
 
 
-def _fetch_wms_mosaic_for_bounds(west: float, south: float, east: float, north: float, zoom: int) -> Tuple[Image.Image, Tuple[float, float, float, float]]:
+def _fetch_wms_mosaic_for_bounds(west: float, south: float, east: float, north: float, zoom: int, source: str = "google_hybrid") -> Tuple[Image.Image, Tuple[float, float, float, float]]:
     """Descarga mosaico WMS y devuelve la imagen y su bounding box real (px_west, px_north, px_east, px_south) en coords pixel del zoom global"""
     px_west_f, px_north_f = _latlon_to_pixel(north, west, zoom)
     px_east_f, px_south_f = _latlon_to_pixel(south, east, zoom)
@@ -768,14 +792,15 @@ def _fetch_wms_mosaic_for_bounds(west: float, south: float, east: float, north: 
     tiles_x = max_tx - min_tx + 1
     tiles_y = max_ty - min_ty + 1
     
-    # Cap tiles if too large
-    if tiles_x * tiles_y > 100:
-        return Image.new("RGB", (100, 100), (0,0,0)), (0,0)
+    # Cap tiles if too large (increased limit for higher res displays)
+    if tiles_x * tiles_y > 225: 
+        print(f"[WMS] Mosaic too large: {tiles_x}x{tiles_y} tiles. Returning tiny dummy.")
+        return Image.new("RGB", (1, 1), (0,0,0)), (0,0)
 
     mosaic = Image.new("RGB", (tiles_x * 256, tiles_y * 256), (20, 20, 20))
     for ty in range(min_ty, max_ty + 1):
         for tx in range(min_tx, max_tx + 1):
-            tile = _fetch_tile(tx, ty, zoom)
+            tile = _fetch_tile(tx, ty, zoom, source=source)
             mosaic.paste(tile, ((tx - min_tx) * 256, (ty - min_ty) * 256))
             
     # Bounding box del mosaico completo en coordenadas píxel globales
@@ -1053,6 +1078,7 @@ def init_worker(
     icon_circle_size_px: int,
     show_compass: bool = True,
     compass_size_px: int = 40,
+    wms_source: str = "google_hybrid",
 ) -> None:
     global _GLOBAL_DATASET, _GLOBAL_VECTORS, _GLOBAL_SETTINGS
     _GLOBAL_DATASET = rasterio.open(ortho_path)
@@ -1080,6 +1106,7 @@ def init_worker(
         "icon_circle_size_px": icon_circle_size_px,
         "show_compass": show_compass,
         "compass_size_px": compass_size_px,
+        "wms_source": wms_source,
     }
 
     def _close_dataset():
@@ -1108,6 +1135,7 @@ def render_frame_job(job: Tuple[int, float, float, float, str]) -> int:
     icon_circle_size_px = _GLOBAL_SETTINGS["icon_circle_size_px"]
     show_compass = _GLOBAL_SETTINGS.get("show_compass", True)
     compass_size_px = _GLOBAL_SETTINGS.get("compass_size_px", 40)
+    wms_source = _GLOBAL_SETTINGS.get("wms_source", "google_hybrid")
 
     # === CRITICAL: Use EXACTLY the same geometry as render_frame() ===
     # This ensures WMS and ortho layers are perfectly aligned
@@ -1146,6 +1174,7 @@ def render_frame_job(job: Tuple[int, float, float, float, str]) -> int:
         icon_circle_size_px,
         show_compass,
         compass_size_px,
+        wms_source=wms_source,
     )
     
     if frame.mode != "RGBA":

@@ -116,7 +116,7 @@ class GPURenderContext:
             except Exception as e:
                 print(f"[GPU] Error clearing memory: {e}")
 
-    def preload(self, dataset, center_points, margin_m, vectors=None, arrow_size=100, cone_len=200):
+    def preload(self, dataset, center_points, margin_m, vectors=None, arrow_size=100, cone_len=200, wms_source="google_hybrid"):
         """
         Loads Ortho, Vectors, and WMS into GPU memory.
         """
@@ -225,8 +225,8 @@ class GPURenderContext:
         else:
             wms_zoom = 18
             
-        print(f"[GPU] Fetching WMS Level {wms_zoom}...")
-        ret_wms = _fetch_wms_mosaic_for_bounds(w_geo, s_geo, e_geo, n_geo, wms_zoom)
+        print(f"[GPU] Fetching WMS Level {wms_zoom} (Source: {wms_source})...")
+        ret_wms = _fetch_wms_mosaic_for_bounds(w_geo, s_geo, e_geo, n_geo, wms_zoom, source=wms_source)
         wms_img = ret_wms[0]
         wms_info = ret_wms[1]
         
@@ -380,9 +380,9 @@ def render_frame_gpu(
     cone_opacity: float,
     icon_circle_opacity: float,
     icon_circle_size_px: int,
-    show_compass: bool = True,
     compass_size_px: int = 40,
-    use_context: bool = True, 
+    use_context: bool = True,
+    wms_source: str = "google_hybrid",
 ) -> Image.Image:
     
     if not HAS_GPU:
@@ -606,6 +606,7 @@ def preload_track_gpu(config: Any, jobs: List[Tuple]) -> None:
             margin_m=margin,
             vectors=vectors,
             arrow_size=config.arrow_size_px,
-            cone_len=config.cone_length_px
+            cone_len=config.cone_length_px,
+            wms_source=config.wms_source
         )
 

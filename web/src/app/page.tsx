@@ -47,6 +47,7 @@ type RenderConfig = {
   output_name: string;
   use_gpu: boolean;
   workers: number;
+  wms_source: string;
 };
 
 type VectorGeometry = {
@@ -157,6 +158,13 @@ const VECTOR_PRESETS = [
   { id: "lindero-general", label: "Lindero general", color: "#EF0B85", width: 3, pattern: "solid", visible: true },
   { id: "vias", label: "Vias", color: "#616161", width: 3, pattern: "solid", visible: true },
   { id: "quebradas", label: "Quebradas", color: "#47AFFF", width: 3, pattern: "solid", visible: true },
+];
+
+const WMS_SOURCES = [
+  { id: "google_hybrid", label: "Google Hyb" },
+  { id: "google_satellite", label: "Google Sat" },
+  { id: "esri_satellite", label: "Esri Sat" },
+  { id: "bing_satellite", label: "Bing Sat" },
 ];
 
 // ==================== UTILITY FUNCTIONS ====================
@@ -391,6 +399,7 @@ export default function Home() {
   const [compassSize, setCompassSize] = useState(40);
   const [outputName, setOutputName] = useState("minimapa.mp4");
   const [useGpu, setUseGpu] = useState(false);
+  const [wmsSource, setWmsSource] = useState("google_hybrid");
 
   // ========== PATH MODE STATE ==========
   const [videoFile, setVideoFile] = useState<File | null>(null);
@@ -583,6 +592,17 @@ export default function Home() {
       y: (mapContainerSize.height - renderHeight) / 2,
     });
   }, [mapContainerSize, naturalSize]);
+
+  // ========== WMS SOURCE EFFECT ==========
+  useEffect(() => {
+    if (!backendOnline) return;
+    if (orthoRef) {
+      setWmsImageUrl(`${API}/ortho-wms-preview?path=${encodeURIComponent(orthoRef.path)}&source=${wmsSource}`);
+    } else {
+      // Default view if no ortho
+      setWmsImageUrl(`${API}/ortho-wms-preview?source=${wmsSource}&bounds=${encodeURIComponent("-79.13,-4.23,-66.85,13.39")}`);
+    }
+  }, [wmsSource, orthoRef, backendOnline]);
 
   // ========== JOB STATUS POLLING (MINIMAP RENDER) ==========
   useEffect(() => {
@@ -892,7 +912,7 @@ export default function Home() {
 
       log("Generando preview...");
       setOrthoImageUrl(`${API}/ortho-preview?path=${encodeURIComponent(ortho.path)}`);
-      setWmsImageUrl(`${API}/ortho-wms-preview?path=${encodeURIComponent(ortho.path)}`);
+      setWmsImageUrl(`${API}/ortho-wms-preview?path=${encodeURIComponent(ortho.path)}&source=${wmsSource}`);
       setBaseLayer("ortho");
 
       log("Carga finalizada.");
@@ -1255,7 +1275,8 @@ export default function Home() {
           icon_circle_size_px: iconCircleSize,
           show_compass: showCompass,
           compass_size_px: compassSize,
-          line_color: DEFAULT_LINE_COLOR, line_width: DEFAULT_LINE_WIDTH, boundary_color: DEFAULT_BOUNDARY_COLOR, boundary_width: DEFAULT_BOUNDARY_WIDTH, point_color: DEFAULT_POINT_COLOR, output_name: safeOutputName, use_gpu: useGpu, workers: 0
+          line_color: DEFAULT_LINE_COLOR, line_width: DEFAULT_LINE_WIDTH, boundary_color: DEFAULT_BOUNDARY_COLOR, boundary_width: DEFAULT_BOUNDARY_WIDTH, point_color: DEFAULT_POINT_COLOR, output_name: safeOutputName, use_gpu: useGpu, workers: 0,
+          wms_source: wmsSource
         };
 
         const res = await fetch(`${API}/preview`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ config, time_sec: previewTime }) });
@@ -1316,7 +1337,8 @@ export default function Home() {
         icon_circle_size_px: iconCircleSize,
         show_compass: showCompass,
         compass_size_px: compassSize,
-        line_color: DEFAULT_LINE_COLOR, line_width: DEFAULT_LINE_WIDTH, boundary_color: DEFAULT_BOUNDARY_COLOR, boundary_width: DEFAULT_BOUNDARY_WIDTH, point_color: DEFAULT_POINT_COLOR, output_name: safeOutputName, use_gpu: useGpu, workers: 0
+        line_color: DEFAULT_LINE_COLOR, line_width: DEFAULT_LINE_WIDTH, boundary_color: DEFAULT_BOUNDARY_COLOR, boundary_width: DEFAULT_BOUNDARY_WIDTH, point_color: DEFAULT_POINT_COLOR, output_name: safeOutputName, use_gpu: useGpu, workers: 0,
+        wms_source: wmsSource
       };
 
       const res = await fetch(`${API}/render`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(config) });
@@ -1336,7 +1358,7 @@ export default function Home() {
       settings: {
         fps, width, height, mapHalfWidth, mapZoomFactor, arrowSize, iconCircleSize,
         coneAngle, coneLength, coneOpacity, iconCircleOpacity, showCompass, compassSize,
-        outputName
+        outputName, wmsSource
       },
       ortho: {
         ref: orthoRef,
@@ -1369,28 +1391,45 @@ export default function Home() {
       try {
         const project = JSON.parse(ev.target?.result as string);
         if (project.settings) {
-          setFps(project.settings.fps);
-          setWidth(project.settings.width);
-          setHeight(project.settings.height);
-          setMapHalfWidth(project.settings.mapHalfWidth);
-          setMapZoomFactor(project.settings.mapZoomFactor);
-          setArrowSize(project.settings.arrowSize);
-          setIconCircleSize(project.settings.iconCircleSize);
-          setConeAngle(project.settings.coneAngle);
-          setConeLength(project.settings.coneLength);
-          setConeOpacity(project.settings.coneOpacity);
-          setIconCircleOpacity(project.settings.iconCircleOpacity);
-          setShowCompass(project.settings.showCompass);
-          setCompassSize(project.settings.compassSize);
-          setOutputName(project.settings.outputName);
+          setFps(project.settings.fps ?? 30);
+          setWidth(project.settings.width ?? 640);
+          setHeight(project.settings.height ?? 360);
+          setMapHalfWidth(project.settings.mapHalfWidth ?? 150);
+          setMapZoomFactor(project.settings.mapZoomFactor ?? 1);
+          setArrowSize(project.settings.arrowSize ?? DEFAULT_ICON_SIZE);
+          setIconCircleSize(project.settings.iconCircleSize ?? DEFAULT_ICON_CIRCLE_SIZE);
+          setConeAngle(project.settings.coneAngle ?? 60);
+          setConeLength(project.settings.coneLength ?? 220);
+          setConeOpacity(project.settings.coneOpacity ?? 0.18);
+          setIconCircleOpacity(project.settings.iconCircleOpacity ?? DEFAULT_ICON_CIRCLE_OPACITY);
+          setShowCompass(project.settings.showCompass ?? true);
+          setCompassSize(project.settings.compassSize ?? 40);
+          setOutputName(project.settings.outputName ?? "minimapa.mp4");
+          // Restore wmsSource or default to hybrid
+          setWmsSource(project.settings.wmsSource || "google_hybrid");
         }
+
         if (project.ortho) {
-          setOrthoRef(project.ortho.ref);
-          setOrthoMetadata(project.ortho.metadata);
-          setOrthoImageUrl(project.ortho.imageUrl);
-          setWmsImageUrl(project.ortho.wmsUrl);
-          setBaseLayer(project.ortho.baseLayer);
-          setNaturalSize(project.ortho.naturalSize);
+          // Handle different possible structures of ortho object
+          const ref = project.ortho.ref || null;
+          const metadata = project.ortho.metadata || null;
+
+          setOrthoRef(ref);
+          setOrthoMetadata(metadata);
+          setBaseLayer(project.ortho.baseLayer || "ortho");
+          setNaturalSize(project.ortho.naturalSize || { width: 0, height: 0 });
+
+          if (ref && ref.path) {
+            // Regenerate URLs for current session
+            const currentWmsSource = project.settings?.wmsSource || "google_hybrid";
+            setOrthoImageUrl(`${API}/ortho-preview?path=${encodeURIComponent(ref.path)}`);
+            setWmsImageUrl(`${API}/ortho-wms-preview?path=${encodeURIComponent(ref.path)}&source=${currentWmsSource}`);
+          } else {
+            setOrthoImageUrl(null);
+            // Default WMS view
+            const currentWmsSource = project.settings?.wmsSource || "google_hybrid";
+            setWmsImageUrl(`${API}/ortho-wms-preview?source=${currentWmsSource}&bounds=${encodeURIComponent("-79.13,-4.23,-66.85,13.39")}`);
+          }
         }
         if (project.routePoints) setRoutePoints(project.routePoints);
         if (project.vectorInputs) {
@@ -1577,6 +1616,20 @@ export default function Home() {
                         Satelital
                       </button>
                     </div>
+                    {baseLayer === "wms" && (
+                      <div className="flex items-center gap-2 rounded-lg border border-[var(--line)] bg-white/50 px-2 py-1">
+                        <span className="text-[10px] font-bold text-[var(--muted)] uppercase tracking-wider">Fuente:</span>
+                        <select
+                          value={wmsSource}
+                          onChange={(e) => setWmsSource(e.target.value)}
+                          className="bg-transparent text-xs font-medium outline-none text-[var(--text)] cursor-pointer"
+                        >
+                          {WMS_SOURCES.map(src => (
+                            <option key={src.id} value={src.id}>{src.label}</option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
                   </div>
                   {pickerMode && <div className="mb-3 flex items-center gap-2 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-sm">Punto {pickerLabel} <button onClick={() => { setPickerMode(null); setEditingPointId(null); setAutoAdvancePicker(false); }} className="ml-auto text-xs text-amber-600">Cancelar</button></div>}
                   <div ref={mapContainerRef} className="relative h-[600px] w-full overflow-hidden rounded-xl border border-[var(--line)] bg-[#0f172a] shadow-inner cursor-crosshair overscroll-contain touch-none" onWheel={handleMapWheel} onMouseDown={handleMapMouseDown} onMouseMove={handleMapMouseMove} onMouseUp={handleMapMouseUp} onMouseLeave={handleMapMouseUp} onClick={handleMapClick}>

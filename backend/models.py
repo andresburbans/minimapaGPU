@@ -63,6 +63,7 @@ class RenderConfig(BaseModel):
     background_opacity: float = 1.0
     use_gpu: bool = False
     workers: int = 0
+    wms_source: str = "google_hybrid"
     output_name: str = "minimapa.mp4"
 
 

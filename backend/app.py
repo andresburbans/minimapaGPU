@@ -1,6 +1,7 @@
 import io
 import math
 import urllib.request
+import functools
 import os
 import shutil
 import subprocess
@@ -197,6 +198,7 @@ def _dispatch_render(cfg: RenderConfig, dataset: rasterio.io.DatasetReader, vect
         "icon_circle_size_px": cfg.icon_circle_size_px,
         "show_compass": cfg.show_compass,
         "compass_size_px": cfg.compass_size_px,
+        "wms_source": cfg.wms_source,
     }
 
     if cfg.use_gpu and GPU_RENDER_AVAILABLE:
@@ -533,16 +535,38 @@ def _choose_zoom(west: float, south: float, east: float, north: float, max_size:
     return 6
 
 
-def _fetch_tile(x: int, y: int, z: int):
+@functools.lru_cache(maxsize=1000)
+def _fetch_tile(x: int, y: int, z: int, source: str = "google_hybrid"):
     from PIL import Image
-    url = f"https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}"
+    
+    # Same logic as render.py to keep things consistent
+    def xyz_to_quadkey(x, y, z):
+        quadkey = ""
+        for i in range(z, 0, -1):
+            digit = 0
+            mask = 1 << (i - 1)
+            if (x & mask) != 0:
+                digit += 1
+            if (y & mask) != 0:
+                digit += 2
+            quadkey += str(digit)
+        return quadkey
+
+    sources = {
+        "google_hybrid": f"https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+        "google_satellite": f"http://www.google.cn/maps/vt?lyrs=s@189&gl=cn&x={x}&y={y}&z={z}",
+        "esri_satellite": f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        "bing_satellite": f"http://ecn.t3.tiles.virtualearth.net/tiles/a{xyz_to_quadkey(x, y, z)}.jpeg?g=0"
+    }
+    
+    url = sources.get(source, sources["google_hybrid"])
     req = urllib.request.Request(url, headers={"User-Agent": "MinimapaGPT/1.0"})
     with urllib.request.urlopen(req, timeout=6) as resp:
         data = resp.read()
     return Image.open(io.BytesIO(data)).convert("RGB")
 
 
-def _fetch_wms_mosaic(west: float, south: float, east: float, north: float, zoom: int):
+def _fetch_wms_mosaic(west: float, south: float, east: float, north: float, zoom: int, source: str = "google_hybrid"):
     from PIL import Image
 
     px_west, px_north = _latlon_to_pixel(north, west, zoom)
@@ -556,12 +580,15 @@ def _fetch_wms_mosaic(west: float, south: float, east: float, north: float, zoom
     tiles_y = max_ty - min_ty + 1
     tiles_x = max(1, tiles_x)
     tiles_y = max(1, tiles_y)
+    
+    if tiles_x * tiles_y > 225:
+        return Image.new("RGB", (1, 1), (0,0,0))
 
     mosaic = Image.new("RGB", (tiles_x * 256, tiles_y * 256), (20, 20, 20))
     for ty in range(min_ty, max_ty + 1):
         for tx in range(min_tx, max_tx + 1):
             try:
-                tile = _fetch_tile(tx, ty, zoom)
+                tile = _fetch_tile(tx, ty, zoom, source=source)
             except Exception:
                 tile = Image.new("RGB", (256, 256), (30, 30, 30))
             mosaic.paste(tile, ((tx - min_tx) * 256, (ty - min_ty) * 256))
@@ -578,7 +605,7 @@ def _fetch_wms_mosaic(west: float, south: float, east: float, north: float, zoom
 
 
 @app.get("/ortho-wms-preview")
-async def ortho_wms_preview(path: Optional[str] = None, max_size: int = 1500, zoom: Optional[int] = None, bounds: Optional[str] = None):
+async def ortho_wms_preview(path: Optional[str] = None, max_size: int = 1500, zoom: Optional[int] = None, bounds: Optional[str] = None, source: str = "google_hybrid"):
     """Genera un preview satelital (tiles). Si no hay path, usa bounds (w,s,e,n)."""
     from rasterio.warp import transform_bounds
     from PIL import Image
@@ -624,7 +651,7 @@ async def ortho_wms_preview(path: Optional[str] = None, max_size: int = 1500, zo
 
         west, south, east, north = _clamp_latlon_bounds(west, south, east, north)
         target_zoom = zoom if zoom is not None else _choose_zoom(west, south, east, north, max_size)
-        img = _fetch_wms_mosaic(west, south, east, north, target_zoom)
+        img = _fetch_wms_mosaic(west, south, east, north, target_zoom, source=source)
         if img.width > max_size or img.height > max_size:
             img.thumbnail((max_size, max_size), Image.LANCZOS)
         buf = io.BytesIO()
