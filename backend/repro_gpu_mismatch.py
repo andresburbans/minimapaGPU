@@ -51,20 +51,42 @@ def test_mismatch():
     output_dir = os.path.join(base_dir, "gpu_validation")
     os.makedirs(output_dir, exist_ok=True)
     
-    # Find a TIF
-    tif_files = [f for f in os.listdir(data_dir) if f.endswith(".tif")]
-    if not tif_files:
-        print("No TIF files found in backend/data. Cannot run test.")
-        return
+    # Check for validation ortho
+    val_ortho = os.path.join(output_dir, "test_ortho_crop.tif")
+    
+    vector_layers = []
+    vectors_paths = []
+    
+    if os.path.exists(val_ortho):
+        ortho_path = val_ortho
+        print(f"Using Validation Ortho: {ortho_path}")
         
-    ortho_path = os.path.join(data_dir, tif_files[0])
-    print(f"Using Ortho: {ortho_path}")
+        # Check for vectors
+        vias = os.path.join(output_dir, "Vias.geojson")
+        if os.path.exists(vias):
+            vector_layers.append(VectorLayer(name="Vias", path=vias, color="#FFFF00", width=4))
+            vectors_paths.append(vias)
+            
+        lindero = os.path.join(output_dir, "LinderoGeneral.geojson")
+        if os.path.exists(lindero):
+            vector_layers.append(VectorLayer(name="Lindero", path=lindero, color="#00FF00", width=4))
+            vectors_paths.append(lindero)
+            
+    else:
+        # Find a TIF in data/
+        tif_files = [f for f in os.listdir(data_dir) if f.endswith(".tif")]
+        if not tif_files:
+            print("No TIF files found in backend/data. Cannot run test.")
+            return
+            
+        ortho_path = os.path.join(data_dir, tif_files[0])
+        print(f"Using Ortho: {ortho_path}")
     
     # Config
     config = Config(
         ortho_path=ortho_path,
-        vector_layers=[],
-        vectors_paths=[],
+        vector_layers=vector_layers,
+        vectors_paths=vectors_paths,
         curves_path="",
         map_half_width_m=280.0 # ~560m width
     )
@@ -76,8 +98,11 @@ def test_mismatch():
         center_n = (bounds.bottom + bounds.top) / 2
         
         # Shift a bit to test non-centered
-        center_e += 500
-        center_n += 500
+        # For the crop, keep it centered as it is small (2048px)
+        # If we shift too much, we might go out of bounds of the crop
+        if "crop" not in ortho_path:
+             center_e += 500
+             center_n += 500
         
         crs = src.crs
 
@@ -88,9 +113,20 @@ def test_mismatch():
     # 1. CPU Render
     print("Rendering CPU Frame...")
     with rasterio.open(ortho_path) as src:
+        # Load vectors for CPU setup (render.py usually loads them individually, but here we pass empty list?
+        # valid render.render_frame takes vectors argument which is a List[Tuple[Iterable...]]
+        # We need to load them first
+        loaded_vectors = render.load_vectors(
+            src.crs,
+            [l.model_dump() for l in vector_layers],
+            vectors_paths,
+            "",
+            "#FF0000", 2, "#00FF00", 2, "#0000FF"
+        )
+        
         cpu_img = render.render_frame(
             dataset=src,
-            vectors=[], # No vectors for basic mismatch test
+            vectors=loaded_vectors, # Pass loaded vectors
             center_e=center_e,
             center_n=center_n,
             heading=heading,
@@ -119,9 +155,15 @@ def test_mismatch():
     render_gpu.preload_track_gpu(config, jobs)
     
     with rasterio.open(ortho_path) as src:
+        # GPU render loads vectors from _CONTEXT, so valid vectors arg is not strictly needed if cached,
+        # BUT render_frame_gpu signature asks for vectors.
+        # However, render_gpu.py implementation uses _CONTEXT.vector_texture if available.
+        # It doesn't use the `vectors` argument for drawing (baking happens in preload).
+        # We can pass empty list or the same list.
+        
         gpu_img = render_gpu.render_frame_gpu(
             dataset=src,
-            vectors=[],
+            vectors=loaded_vectors, # Pass same vectors just in case
             center_e=center_e,
             center_n=center_n,
             heading=heading,
@@ -152,7 +194,7 @@ def test_mismatch():
     mse = cp.mean(diff)
     print(f"Mean Squared Error (Pixel Diff): {mse}")
     
-    if mse < 5.0: # arbitrary threshold for "visually similar enough" given different resampling
+    if mse < 15.0: # Increased threshold for Complex rendering (Vectors + WMS + Mipmaps)
         print("SUCCESS: GPU Render matches CPU Render!")
     else:
         print("WARNING: Significant difference detected.")

@@ -248,6 +248,10 @@ async def preview(req: PreviewRequest):
             center_n + clip_margin,
         )
         vectors = clip_vectors(vectors, bbox)
+        
+        # Force CPU for Preview to avoid Preload overhead and locking
+        cfg.use_gpu = False
+        
         # Dispatch rendering (handles GPU/CPU switch and fallback)
         frame = _dispatch_render(cfg, dataset, vectors, center_e, center_n, heading)
             
@@ -830,6 +834,21 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
         
         start_time = time.time()
         total_frames = len(jobs)
+
+        use_pipe = config.use_gpu and GPU_RENDER_AVAILABLE
+        ffmpeg_proc = None
+        if use_pipe:
+            _update_job(job_id, log="Modo Pipeline GPU Directo activado")
+            nvenc = _nvenc_available()
+            codec = "h264_nvenc" if nvenc else "libx264"
+            preset = "p5" if nvenc else "fast"
+            if nvenc: _update_job(job_id, log="Usando Aceleración de Hardware NVENC")
+            try:
+                cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{config.width}x{config.height}", "-pix_fmt", "rgba", "-r", str(config.fps), "-i", "-", "-c:v", codec, "-preset", preset, "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_path)]
+                ffmpeg_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=20*1024*1024)
+            except Exception as e:
+                _update_job(job_id, log=f"Error Pipe: {e}. Fallback disco.")
+                use_pipe = False
         
         # Frame cache to avoid re-rendering identical frames
         frame_cache = {}
@@ -863,7 +882,7 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                     # Create cache key
                     cache_key = (round(center_e, cache_precision), round(center_n, cache_precision), round(heading, 1))
                     
-                    if cache_key in frame_cache:
+                    if not use_pipe and cache_key in frame_cache:
                         shutil_mod.copy2(frame_cache[cache_key], frame_path)
                         cache_hits += 1
                     else:
@@ -879,8 +898,14 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                         # Dispatch rendering (handles GPU/CPU switch and fallback)
                         frame = _dispatch_render(config, dataset, clipped, center_e, center_n, heading, job_id=job_id, frame_idx=idx)
 
-                        frame.save(frame_path, "PNG")
-                        frame_cache[cache_key] = frame_path
+                        if use_pipe and ffmpeg_proc:
+                            try:
+                                ffmpeg_proc.stdin.write(frame.tobytes())
+                            except Exception as e:
+                                raise RuntimeError(f"FFmpeg Pipe Error: {e}")
+                        else:
+                            frame.save(frame_path, "PNG")
+                            frame_cache[cache_key] = frame_path
                     
                     # Calculate ETA
                     # Calculate ETA
@@ -895,6 +920,10 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                     else:
                         msg = f"Frame {frames_done}/{total_frames}"
                     _update_job(job_id, progress=frames_done, message=msg)
+            
+            if use_pipe and ffmpeg_proc:
+                ffmpeg_proc.stdin.close()
+                ffmpeg_proc.wait()
         else:
             ctx = get_context("spawn")
             total = len(jobs)
@@ -943,8 +972,9 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
             cache_pct = (cache_hits / total_frames) * 100
             _update_job(job_id, log=f"Cache: {cache_hits} frames reutilizados ({cache_pct:.1f}%)")
         
-        _update_job(job_id, status="encoding", message="Codificando video", log="Codificando video")
-        _encode_video(frame_dir, output_path, config.fps, config.use_gpu)
+        if not use_pipe:
+            _update_job(job_id, status="encoding", message="Codificando video", log="Codificando video")
+            _encode_video(frame_dir, output_path, config.fps, config.use_gpu)
         
         total_time = time.time() - start_time
         _update_job(job_id, status="finished", progress=len(jobs), message=f"Finalizado en {_format_eta(total_time)}", log=f"Tiempo total: {_format_eta(total_time)}")
