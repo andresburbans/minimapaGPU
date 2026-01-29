@@ -754,6 +754,17 @@ async def status(job_id: str):
     return job
 
 
+@app.post("/cancel/{job_id}")
+async def cancel_job(job_id: str):
+    with _JOB_LOCK:
+        job = _JOBS.get(job_id)
+        if job and job["status"] in ["queued", "rendering", "encoding", "tracking", "optimizing"]:
+            job["cancel_requested"] = True
+            job["log"].append("🛑 Solicitud de cancelación recibida...")
+            return {"success": True}
+    return {"success": False, "message": "Job not found or not active"}
+
+
 @app.get("/health")
 async def health():
     gpu_info = gpu_utils.detect_cuda_gpu()
@@ -832,6 +843,25 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
 
         _update_job(job_id, status="rendering", message="Renderizando frames", log="Renderizando frames")
         
+        if workers <= 1:
+            # OPTIMIZATION: Pre-load whole track area to GPU if available
+            if config.use_gpu and GPU_RENDER_AVAILABLE:
+                try:
+                    from render_gpu import preload_track_gpu
+                    _update_job(job_id, log="Iniciando precarga en GPU...")
+                    def preload_cb(pct, msg):
+                        # Force log update
+                        _update_job(job_id, log=f"Precarga {pct}%: {msg}")
+                    
+                    preload_track_gpu(config, jobs, progress_callback=preload_cb) 
+                except Exception as e:
+                    err_msg = f"[GPU] Error crítico en precarga: {e}. El proceso se detiene por seguridad."
+                    _update_job(job_id, status="failed", message=err_msg, log=err_msg)
+                    raise RuntimeError(err_msg)
+            
+            # Reset timer after preload to avoid skewing ETA
+            start_time = time.time()
+        
         start_time = time.time()
         total_frames = len(jobs)
 
@@ -850,22 +880,30 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                 _update_job(job_id, log=f"Error Pipe: {e}. Fallback disco.")
                 use_pipe = False
         
+        # Prepare Pinned Memory for Zero-Copy Transfer
+        pinned_cpu_buffer = None
+        if use_pipe and GPU_RENDER_AVAILABLE:
+            try:
+                import cupy as cp
+                import numpy as np
+                # Allocate Pinned Memory (Page-locked)
+                # Size: Width x Height x 4 (RGBA)
+                alloc_size = config.width * config.height * 4
+                pinned_mem = cp.cuda.alloc_pinned_memory(alloc_size)
+                # Create Numpy array backed by pinned memory (Slice to exact size)
+                pinned_cpu_buffer = np.frombuffer(pinned_mem, np.uint8)[:alloc_size].reshape((config.height, config.width, 4))
+                _update_job(job_id, log="Memoria 'Pinned' activada.")
+            except Exception as e:
+                _update_job(job_id, log=f"No Pinned Mem: {e}")
+                pinned_cpu_buffer = None
+
         # Frame cache to avoid re-rendering identical frames
         frame_cache = {}
         cache_precision = 4
         cache_hits = 0
-        if workers <= 1:
-            # OPTIMIZATION: Pre-load whole track area to GPU if available
-            if config.use_gpu and GPU_RENDER_AVAILABLE:
-                try:
-                    from render_gpu import preload_track_gpu
-                    _update_job(job_id, log="Optimizando texturas en GPU para máxima velocidad...")
-                    preload_track_gpu(config, jobs)
-                except Exception as e:
-                    err_msg = f"[GPU] Error crítico en precarga: {e}. El proceso se detiene por seguridad."
-                    _update_job(job_id, status="failed", message=err_msg, log=err_msg)
-                    raise RuntimeError(err_msg)
 
+
+        if workers <= 1:
             with rasterio.open(config.ortho_path) as dataset:
                 vectors = load_vectors(
                     dataset.crs,
@@ -879,6 +917,12 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                     config.point_color,
                 )
                 for idx, center_e, center_n, heading, frame_path in jobs:
+                    # Check Cancellation
+                    with _JOB_LOCK:
+                        if _JOBS.get(job_id, {}).get("cancel_requested"):
+                            _update_job(job_id, status="cancelled", message="Cancelado por usuario", log="🛑 Cancelado.")
+                            raise InterruptedError("Cancelled")
+
                     # Create cache key
                     cache_key = (round(center_e, cache_precision), round(center_n, cache_precision), round(heading, 1))
                     
@@ -898,12 +942,41 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                         # Dispatch rendering (handles GPU/CPU switch and fallback)
                         frame = _dispatch_render(config, dataset, clipped, center_e, center_n, heading, job_id=job_id, frame_idx=idx)
 
-                        if use_pipe and ffmpeg_proc:
+                        if idx == 0 and hasattr(frame, 'max'):
+                             try:
+                                 m = frame.max()
+                                 if hasattr(m, 'item'): m = m.item()
+                                 _update_job(job_id, log=f"[DEBUG] GPU Frame 0 Max: {m}")
+                             except: pass
+
+                        # Handle Output (Pinned mem or Standard)
+                        bytes_to_write = None
+                        if use_pipe and pinned_cpu_buffer is not None and hasattr(frame, 'get'):
+                            frame.get(out=pinned_cpu_buffer)
+                            # Draw Compass on CPU Pinned Buffer (In-Place)
+                            if config.show_compass:
+                                 pim = Image.frombuffer("RGBA", (config.width, config.height), pinned_cpu_buffer, "raw", "RGBA", 0, 1)
+                                 c_pos = (config.width - config.compass_size_px - 10, config.compass_size_px + 10)
+                                 from render import _draw_compass
+                                 _draw_compass(pim, c_pos, config.compass_size_px, -heading)
+                            bytes_to_write = pinned_cpu_buffer.tobytes()
+                        elif use_pipe:
+                             if hasattr(frame, 'tobytes'): bytes_to_write = frame.tobytes()
+                             elif hasattr(frame, 'get'): bytes_to_write = frame.get().tobytes()
+
+                        if use_pipe and ffmpeg_proc and bytes_to_write:
                             try:
-                                ffmpeg_proc.stdin.write(frame.tobytes())
+                                ffmpeg_proc.stdin.write(bytes_to_write)
                             except Exception as e:
                                 raise RuntimeError(f"FFmpeg Pipe Error: {e}")
                         else:
+                            # Disk fallback
+                            if hasattr(frame, 'get'):
+                                frame = Image.fromarray(frame.get(), "RGBA")
+                                if config.show_compass:
+                                    c_pos = (config.width - config.compass_size_px - 10, config.compass_size_px + 10)
+                                    from render import _draw_compass
+                                    _draw_compass(frame, c_pos, config.compass_size_px, -heading)
                             frame.save(frame_path, "PNG")
                             frame_cache[cache_key] = frame_path
                     
@@ -916,9 +989,10 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                         fps_rate = frames_done / elapsed
                         remaining = total_frames - frames_done
                         eta_str = _format_eta(remaining / fps_rate if fps_rate > 0 else 0)
-                        msg = f"Frame {frames_done}/{total_frames} • ETA: {eta_str}"
+                        pct = int((frames_done / total_frames) * 100)
+                        msg = f"{pct}% • Frame {frames_done}/{total_frames} • {fps_rate:.1f} FPS • ETA {eta_str}"
                     else:
-                        msg = f"Frame {frames_done}/{total_frames}"
+                        msg = f"Iniciando... Frame {frames_done}/{total_frames}"
                     _update_job(job_id, progress=frames_done, message=msg)
             
             if use_pipe and ffmpeg_proc:
@@ -957,6 +1031,13 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                 for _ in pool.imap_unordered(
                     render_frame_job, jobs, chunksize=max(1, total // (workers * 4))
                 ):
+                    # Check Cancellation in CPU Loop
+                    with _JOB_LOCK:
+                         if _JOBS.get(job_id, {}).get("cancel_requested"):
+                             pool.terminate()
+                             _update_job(job_id, status="cancelled", message="Cancelado por usuario", log="🛑 Cancelado.")
+                             raise InterruptedError("Cancelled")
+
                     done += 1
                     elapsed = time.time() - start_time
                     if done > 0 and elapsed > 0:
@@ -978,6 +1059,14 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
         
         total_time = time.time() - start_time
         _update_job(job_id, status="finished", progress=len(jobs), message=f"Finalizado en {_format_eta(total_time)}", log=f"Tiempo total: {_format_eta(total_time)}")
+    except InterruptedError:
+        # Status already set to cancelled inside loop
+        if use_pipe and ffmpeg_proc:
+             try:
+                 ffmpeg_proc.stdin.close()
+                 ffmpeg_proc.wait()
+             except: pass
+        pass
     except Exception as exc:
         _update_job(job_id, status="error", message="Error en render", log=str(exc), error=str(exc))
     finally:

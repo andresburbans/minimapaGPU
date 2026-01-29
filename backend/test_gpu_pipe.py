@@ -1,159 +1,144 @@
 
 import os
 import sys
-import subprocess
 import time
-import rasterio
-from PIL import Image
-from dataclasses import dataclass
-from typing import List
+import subprocess
+import numpy as np
 
-# Mock Config
-@dataclass
-class VectorLayer:
-    model_dump = lambda self: {}
+# Add backend to path
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-@dataclass
-class Config:
-    ortho_path: str
-    width: int
-    height: int
-    fps: int
-    vector_layers: list
-    vectors_paths: list
-    curves_path: str
-    line_color: str = "#FF0000"
-    line_width: int = 5
-    boundary_color: str = "#00FF00"
-    boundary_width: int = 5
-    point_color: str = "#0000FF"
-    map_half_width_m: float = 100.0
-    arrow_size_px: int = 50
-    cone_length_px: int = 100
-    cone_angle_deg: float = 60
-    cone_opacity: float = 0.5
-    icon_circle_opacity: float = 0.5
-    icon_circle_size_px: int = 20
-    show_compass: bool = True
-    compass_size_px: int = 40
-    wms_source: str = "google_hybrid"
-    use_gpu: bool = True
+import backend.gpu_utils as gpu_utils
+print(f"[TEST] GPUs: {gpu_utils.detect_cuda_gpu()}")
 
-def test_pipe():
-    print("Starting GPU Pipe Test...")
+try:
+    import cupy as cp
+    import backend.render_gpu as render_gpu
+    from rasterio.transform import Affine
+    print(f"[TEST] CuPy Imported. Device: {cp.cuda.Device(0).compute_capability}")
+except ImportError as e:
+    print(f"[TEST] CuPy Import Failed: {e}")
+    sys.exit(1)
+
+def setup_dummy_context():
+    """Inject dummy data into render_gpu context to force valid rendering path."""
+    print("[TEST] Setting up Dummy Context (16k Texture + Mipmaps)...")
     
-    # Paths
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(base_dir, "gpu_validation")
-    os.makedirs(output_dir, exist_ok=True)
+    # Create 8k texture (FHD needs high res to simulate load)
+    # 8192x8192 RGBA
+    h, w = 8192, 8192
     
-    ortho_path = os.path.join(output_dir, "test_ortho_crop.tif")
-    if not os.path.exists(ortho_path):
-        print(f"Ortho not found: {ortho_path}")
-        return
+    # Allocate on GPU
+    tex_hwc = cp.random.randint(0, 255, (h, w, 4), dtype=cp.uint8)
+    tex_chw = cp.ascontiguousarray(tex_hwc.transpose(2, 0, 1))
+    
+    render_gpu._CONTEXT.ortho_texture = tex_chw
+    render_gpu._CONTEXT.ortho_w = w
+    render_gpu._CONTEXT.ortho_h = h
+    
+    # 0.1m per pixel
+    render_gpu._CONTEXT.ortho_res_m = 0.1
+    # Identity transform (Pixel 0,0 = 0m, 0m)
+    render_gpu._CONTEXT.ortho_transform = Affine(0.1, 0.0, 0.0, 0.0, -0.1, h*0.1)
+    render_gpu._CONTEXT.ortho_crs = "EPSG:3857"
+    
+    # Mipmaps
+    print("[TEST] Mipmaps...")
+    render_gpu._CONTEXT.mipmaps = [tex_chw]
+    # L1
+    l1 = cp.ascontiguousarray(tex_chw[:, ::2, ::2])
+    render_gpu._CONTEXT.mipmaps.append(l1)
+    # L2
+    l2 = cp.ascontiguousarray(l1[:, ::2, ::2])
+    render_gpu._CONTEXT.mipmaps.append(l2)
+    
+    render_gpu._CONTEXT.is_ready = True
+    print("[TEST] Context Ready.")
 
-    # Check Render GPU avail
+def run_test():
+    # FHD Output
+    W, H = 1920, 1080
+    FPS = 30
+    DURATION_SEC = 2 # Short run
+    TOTAL_FRAMES = FPS * DURATION_SEC
+    
+    OUTPUT_FILE = r"backend/gpu_validation/pipe_test.mp4"
+    if not os.path.exists("backend/gpu_validation"):
+        os.makedirs("backend/gpu_validation")
+        
+    # Setup Context
     try:
-        import render_gpu
-        if not render_gpu.init_gpu()["available"]:
-            print("GPU not available.")
-            return
-    except ImportError:
-        print("render_gpu not found")
-        return
-
-    config = Config(
-        ortho_path=ortho_path,
-        width=1280,
-        height=720,
-        fps=30,
-        vector_layers=[],
-        vectors_paths=[],
-        curves_path=""
-    )
-    
-    # 3 sec video = 90 frames
-    total_frames = 90
-    
-    output_video = os.path.join(output_dir, "pipe_test.mp4")
-    
-    # FFmpeg Cmd
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo",
-        "-vcodec", "rawvideo",
-        "-s", f"{config.width}x{config.height}",
-        "-pix_fmt", "rgba",
-        "-r", str(config.fps),
-        "-i", "-",
-        "-c:v", "h264_nvenc", # Force NVENC for test
-        "-preset", "p1", # Fastest
-        "-pix_fmt", "yuv420p",
-        output_video
-    ]
-    
-    print(f"Running FFmpeg: {' '.join(cmd)}")
-    
-    try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=10**7)
+        setup_dummy_context()
     except Exception as e:
-        print(f"Failed to start ffmpeg: {e}")
+        print(f"[TEST] Failed to setup context: {e}")
         return
 
-    # Preload
-    jobs = [(i, 0, 0) for i in range(total_frames)] # Dummy
-    # Need real centers
-    with rasterio.open(ortho_path) as src:
-        cx, cy = (src.bounds.left + src.bounds.right)/2, (src.bounds.bottom + src.bounds.top)/2
-        # Move center 1000m East (1km)
-        centers = []
-        for i in range(total_frames):
-            centers.append((i, cx + i*10, cy))
+    # Mock Data (Movement across dummy map)
+    # Center of map is w/2 * res = 4096 * 0.1 = 409
+    cx, cy = 400.0, 400.0
+
+    # Pinned Mem Setup (Zero Copy)
+    alloc_size = W * H * 4
+    try:
+        pinned_mem = cp.cuda.alloc_pinned_memory(alloc_size)
+        pinned_buffer = np.frombuffer(pinned_mem, np.uint8)[:alloc_size].reshape((H, W, 4))
+    except Exception as e:
+        print(f"[TEST] Pinned Memory Failed: {e}")
+        return
+
+    # FFmpeg Command
+    cmd = [
+        'ffmpeg', '-y',
+        '-f', 'rawvideo', '-vcodec', 'rawvideo',
+        '-s', f'{W}x{H}', '-pix_fmt', 'rgba',
+        '-r', str(FPS),
+        '-i', '-',
+        '-c:v', 'h264_nvenc', '-preset', 'p1', '-pix_fmt', 'yuv420p',
+        OUTPUT_FILE, '-loglevel', 'error'
+    ]
+
+    print(f"[TEST] Starting 3 Cycles (FHD 1080p) WITH HEAVY RENDER...")
+
+    for cycle in range(1, 4):
+        print(f"\n--- CYCLE {cycle} ---")
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        t0 = time.time()
         
-        # Preload
-        render_gpu.preload_track_gpu(config, [(0, cx, cy), (0, cx+1000, cy)])
-        
-        start_t = time.time()
-        for i in range(total_frames):
-            idx, ce, cn = centers[i]
-            img = render_gpu.render_frame_gpu(
-                dataset=src,
-                vectors=[],
-                center_e=ce,
-                center_n=cn,
-                heading=i * 2, # Rotate
-                width=config.width,
-                height=config.height,
-                map_half_width_m=config.map_half_width_m,
-                arrow_size_px=config.arrow_size_px,
-                cone_angle_deg=config.cone_angle_deg,
-                cone_length_px=config.cone_length_px,
-                cone_opacity=config.cone_opacity,
-                icon_circle_opacity=config.icon_circle_opacity,
-                icon_circle_size_px=config.icon_circle_size_px,
-                show_compass=config.show_compass,
-                wms_source=config.wms_source
-            )
-            
-            # Pipe
-            try:
-                proc.stdin.write(img.tobytes())
-            except Exception as e:
-                print(f"Pipe write error: {e}")
-                break
+        try:
+            for i in range(TOTAL_FRAMES):
+                # Render (Valid Context)
+                # render_frame_gpu args: dataset, vectors, e, n, heading...
+                # We pass None for dataset as context is ready.
                 
-        proc.stdin.close()
-        proc.wait()
-        
-        end_t = time.time()
-        dur = end_t - start_t
-        fps = total_frames / dur
-        print(f"Finished {total_frames} frames in {dur:.2f}s ({fps:.2f} FPS)")
-        
-        if os.path.exists(output_video) and os.path.getsize(output_video) > 1000:
-            print("SUCCESS: Video created.")
-        else:
-            print("FAILURE: Video missing or empty.")
+                # Move center
+                ce = cx + i * 0.5
+                cn = cy + i * 0.5
+                
+                gpu_frame = render_gpu.render_frame_gpu(
+                    None, [], ce, cn, 45.0 + i, W, H, 100.0, 50, 60.0, 200, 0.3, 0.5, 20,
+                    show_compass=True, compass_size_px=40
+                )
+
+                # Pinned Transfer
+                if hasattr(gpu_frame, 'get'):
+                     gpu_frame.get(out=pinned_buffer)
+                     proc.stdin.write(pinned_buffer.tobytes())
+                else:
+                     proc.stdin.write(gpu_frame.tobytes())
+                
+                if i % 10 == 0:
+                    print(f"Cycle {cycle}: {i}/{TOTAL_FRAMES}", end='\r')
+
+            proc.stdin.close()
+            proc.wait()
+            total_t = time.time() - t0
+            print(f"Cycle {cycle}: {TOTAL_FRAMES} frames in {total_t:.2f}s => {TOTAL_FRAMES/total_t:.2f} FPS")
+            
+        except Exception as e:
+            print(f"[TEST] Error: {e}")
+            import traceback
+            traceback.print_exc()
+            proc.kill()
 
 if __name__ == "__main__":
-    test_pipe()
+    run_test()

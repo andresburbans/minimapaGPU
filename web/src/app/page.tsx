@@ -1302,6 +1302,16 @@ export default function Home() {
   };
 
 
+  const handleCancel = async () => {
+    if (!jobId) return;
+    try {
+      await fetch(`${API}/cancel/${jobId}`, { method: "POST" });
+    } catch (err) {
+      console.error(err);
+      alert("Error al intentar cancelar.");
+    }
+  };
+
   const handleRender = async () => {
     if (routePoints.length === 0) return;
 
@@ -2203,13 +2213,24 @@ export default function Home() {
 
 
                 </div>
-                <button
-                  onClick={handleRender}
-                  disabled={renderBusy || routePoints.length === 0 || !backendOnline || (canPickMinimapSave && !minimapSaveHandle)}
-                  className="mt-4 w-full rounded-xl bg-emerald-600 py-3 text-white font-semibold disabled:opacity-50"
-                >
-                  {renderBusy ? "Renderizando..." : "Generar video MP4"}
-                </button>
+                <div className="mt-4 flex gap-2">
+                  <button
+                    onClick={handleRender}
+                    disabled={renderBusy || routePoints.length === 0 || !backendOnline || (canPickMinimapSave && !minimapSaveHandle)}
+                    className={`flex-1 rounded-xl py-3 text-white font-semibold disabled:opacity-50 ${renderBusy ? "bg-emerald-600/70" : "bg-emerald-600 hover:bg-emerald-700"}`}
+                  >
+                    {renderBusy ? "Renderizando..." : "Generar video MP4"}
+                  </button>
+                  {renderBusy && (
+                    <button
+                      onClick={handleCancel}
+                      className="rounded-xl bg-red-500 px-6 py-3 text-white font-bold hover:bg-red-600 transition shadow-lg"
+                      title="Detener proceso"
+                    >
+                      🛑 Detener
+                    </button>
+                  )}
+                </div>
                 {jobStatus && <div className="mt-2 text-xs text-[var(--muted)]">{jobStatus.message}</div>}
                 <div className="mt-3 h-2 overflow-hidden rounded-full border border-[var(--line)] bg-white/70">
                   <div
