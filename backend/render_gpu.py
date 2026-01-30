@@ -235,8 +235,7 @@ def _sample_wms_layer_gpu_approx(
     n_pts = np.array([p[1] for p in geo_pts])
     
     # 3. To WGS84 and then to Mosaic Pixels
-    from_crs = CRS.from_user_input(ortho_crs)
-    transformer = Transformer.from_crs(from_crs, "EPSG:4326", always_xy=True)
+    transformer = _CONTEXT.get_wms_transformer(ortho_crs)
     lons, lats = transformer.transform(e_pts, n_pts)
     
     n_z = 2.0 ** wms_zoom
@@ -286,12 +285,59 @@ class GPURenderContext:
         self.wms_bounds_px = None 
         self.wms_zoom = None
         self.is_ready = False
+        
+        # P1-B: Cached Transformer for WMS
+        self._wms_transformer: Optional[Transformer] = None
+        self._wms_from_crs_str: Optional[str] = None
+        
+        # P0-B: Pre-allocated work buffers
+        self._work_buffers_initialized = False
+        self._composite_buffer: Optional[cp.ndarray] = None  # (max_h, max_w, 4)
+        self._max_supersampled_size: Tuple[int, int] = (0, 0)
+
+    def get_wms_transformer(self, ortho_crs) -> Transformer:
+        """Obtains the transformer for WMS, caching it if possible."""
+        crs_str = str(ortho_crs)
+        if self._wms_transformer is not None and self._wms_from_crs_str == crs_str:
+            return self._wms_transformer
+        
+        from_crs = CRS.from_user_input(ortho_crs)
+        self._wms_transformer = Transformer.from_crs(from_crs, "EPSG:4326", always_xy=True)
+        self._wms_from_crs_str = crs_str
+        return self._wms_transformer
+
+    def _ensure_work_buffers(self, ss_width: int, ss_height: int):
+        """Ensures work buffers are allocated for the given supersampled size."""
+        if (self._work_buffers_initialized and 
+            ss_width <= self._max_supersampled_size[0] and
+            ss_height <= self._max_supersampled_size[1]):
+            return
+        
+        # Allocate with 20% margin to avoid frequent re-allocations
+        alloc_w = int(ss_width * 1.2)
+        alloc_h = int(ss_height * 1.2)
+        
+        if self._composite_buffer is not None:
+            del self._composite_buffer
+            cp.get_default_memory_pool().free_all_blocks()
+            
+        self._composite_buffer = cp.zeros((alloc_h, alloc_w, 4), dtype=cp.uint8)
+        self._max_supersampled_size = (alloc_w, alloc_h)
+        self._work_buffers_initialized = True
+
+    def get_composite_slice(self, h: int, w: int) -> cp.ndarray:
+        """Returns a slice of the pre-allocated composite buffer."""
+        return self._composite_buffer[:h, :w, :]
 
     def clear(self):
         self.ortho_texture = None
         self.mipmaps = []
         self.vector_texture = None
         self.wms_texture = None
+        self._wms_transformer = None
+        self._wms_from_crs_str = None
+        self._composite_buffer = None
+        self._work_buffers_initialized = False
         self.is_ready = False
         import gc
         gc.collect()
@@ -409,6 +455,9 @@ def render_frame_gpu(
     scale_ratio = m_per_px_out / _CONTEXT.ortho_res_m
     level = 2 if scale_ratio >= 4.0 and len(_CONTEXT.mipmaps) > 2 else (1 if scale_ratio >= 2.0 and len(_CONTEXT.mipmaps) > 1 else 0)
         
+    # Ensure work buffers are ready
+    _CONTEXT._ensure_work_buffers(sw, sh)
+    
     # Render Layers
     if _CONTEXT.wms_texture is not None:
         final_gpu = _sample_wms_layer_gpu_approx(
@@ -416,7 +465,8 @@ def render_frame_gpu(
             _CONTEXT.wms_zoom, _CONTEXT.wms_bounds_px
         )
     else:
-        final_gpu = cp.zeros((sh, sw, 4), dtype=cp.uint8)
+        final_gpu = _CONTEXT.get_composite_slice(sh, sw)
+        final_gpu.fill(0)
         
     if _CONTEXT.mipmaps:
         ortho_layer = _sample_using_inverse_transform(
