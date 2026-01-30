@@ -58,7 +58,7 @@ app.add_middleware(
     allow_origins=[
         "*",
     ],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -337,7 +337,7 @@ async def gpu_info():
 
 
 @app.get("/stats")
-async def stats():
+def stats():
     """Endpoint de telemetría en tiempo real"""
     return gpu_utils.get_system_stats()
 
@@ -766,7 +766,7 @@ async def cancel_job(job_id: str):
 
 
 @app.get("/health")
-async def health():
+def health():
     gpu_info = gpu_utils.detect_cuda_gpu()
     return {
         "status": "ok",

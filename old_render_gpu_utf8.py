@@ -1,4 +1,4 @@
-
+﻿
 import math
 import logging
 import io
@@ -361,7 +361,7 @@ class GPURenderContext:
         w_geo, s_geo, e_geo, n_geo = transform_bounds(dataset.crs, "EPSG:4326", xmin, ymin, xmax, ymax)
         span_deg = max(e_geo - w_geo, n_geo - s_geo)
         # Use same logic as CPU for zoom
-        TARGET_PX = 2048
+        TARGET_PX = 3840
         wms_zoom = min(19, max(1, int(math.log2((TARGET_PX * 360) / (256 * span_deg)) + 0.5)))
         
         ret_wms = _fetch_wms_mosaic_for_bounds(w_geo, s_geo, e_geo, n_geo, wms_zoom, source=wms_source)

@@ -40,15 +40,43 @@ def fix_cuda_dll_paths():
 
     # Estrategia 1: Buscar carpetas 'nvidia/*/bin' (estándar pip)
     for root in search_roots:
-        nvidia_base = root / "lib" / "site-packages" / "nvidia" # Ajuste comun venv windows
-        if not nvidia_base.exists():
-             nvidia_base = root / "nvidia" # Intentar directo
+        # Posibles ubicaciones de la carpeta 'nvidia'
+        possible_nvidia_dirs = [
+            root / "nvidia",
+            root / "Lib" / "site-packages" / "nvidia",
+            root / "lib" / "site-packages" / "nvidia",
+        ]
         
-        if nvidia_base.exists():
-            for bin_dir in nvidia_base.rglob("bin"):
-                if bin_dir.is_dir():
-                    path_str = str(bin_dir.absolute())
-                    if path_str not in added_paths:
+        for nvidia_base in possible_nvidia_dirs:
+            if nvidia_base.exists() and nvidia_base.is_dir():
+                try:
+                    # Listamos carpetas de paquetes (cuda_runtime, nvrtc, etc)
+                    for pkg_dir in nvidia_base.iterdir():
+                        if pkg_dir.is_dir():
+                            bin_dir = pkg_dir / "bin"
+                            if bin_dir.exists() and bin_dir.is_dir():
+                                path_str = str(bin_dir.absolute())
+                                if path_str not in added_paths:
+                                    try:
+                                        os.add_dll_directory(path_str)
+                                        if path_str not in os.environ["PATH"]:
+                                            os.environ["PATH"] = path_str + os.pathsep + os.environ["PATH"]
+                                        added_paths.add(path_str)
+                                    except Exception:
+                                        pass
+                except Exception:
+                    pass
+
+    # Estrategia 2: Buscar en el root del venv (algunas instalaciones ponen DLLs en la raíz o en bin)
+    for root in search_roots:
+        for bin_name in ["bin", "Scripts"]:
+            bin_dir = root / bin_name
+            if bin_dir.exists() and bin_dir.is_dir():
+                path_str = str(bin_dir.absolute())
+                if path_str not in added_paths:
+                    # Solo agregamos si contiene alguna de nuestras DLLs objetivo
+                    has_target = any((bin_dir / dll).exists() for dll in target_dlls)
+                    if has_target:
                         try:
                             os.add_dll_directory(path_str)
                             if path_str not in os.environ["PATH"]:
@@ -56,35 +84,12 @@ def fix_cuda_dll_paths():
                             added_paths.add(path_str)
                         except Exception:
                             pass
-
-    # Estrategia 2: Fuerza bruta - buscar el archivo DLL específico si aún no parece cargado
-    # Esto es lento pero seguro si la estructura de carpetas cambió
-    found_any = False
-    for root in search_roots:
-        for dll_name in target_dlls:
-            # Rglob puede ser lento, limitamos a subcarpetas probables si es posible, o root
-            # Buscamos en todo el root del venv por si acaso
-            try:
-                found = list(root.rglob(dll_name))
-                for f in found:
-                    parent = str(f.parent.absolute())
-                    if parent not in added_paths:
-                        try:
-                            os.add_dll_directory(parent)
-                            if parent not in os.environ["PATH"]:
-                                os.environ["PATH"] = parent + os.pathsep + os.environ["PATH"]
-                            added_paths.add(parent)
-                            print(f"[GPU] DLL crítico encontrado y ruta agregada: {parent}")
-                            found_any = True
-                        except Exception:
-                            pass
-            except Exception:
-                pass
                 
     if added_paths:
         print(f"[GPU] Se agregaron {len(added_paths)} directorios de DLLs de NVIDIA al search path.")
     else:
-        print("[GPU] ADVERTENCIA: No se encontraron directorios de DLLs de NVIDIA. CuPy podría fallar.")
+        # Si no encontramos nada con búsqueda rápida, avisar pero no bloquear con rglob
+        print("[GPU] ADVERTENCIA: No se encontraron directorios de DLLs de NVIDIA mediante búsqueda rápida.")
 
 
 _GPU_INFO: Optional[Dict] = None
@@ -187,12 +192,23 @@ def force_cuda_gpu(gpu_id: Optional[int] = None) -> bool:
     return True
 
 
+_LAST_STATS = {"time": 0, "data": None}
+
 def get_system_stats() -> Dict:
     """
     Obtiene estadísticas en tiempo real de CPU y GPU.
+    Cacheado por 2 segundos para evitar saturar con llamadas a nvidia-smi.
     """
     import psutil
+    import time
     
+    global _LAST_STATS
+    now = time.time()
+    
+    # Retornar cache si es reciente (< 2s)
+    if _LAST_STATS["data"] and (now - _LAST_STATS["time"] < 2.0):
+        return _LAST_STATS["data"]
+
     stats = {
         "cpu_usage": psutil.cpu_percent(interval=None),
         "ram_usage": psutil.virtual_memory().percent,
@@ -231,21 +247,26 @@ def get_system_stats() -> Dict:
                     stats["gpu_temp"] = float(parts[1].strip())
             except Exception:
                 pass
-                
+    
+    _LAST_STATS = {"time": now, "data": stats}
     return stats
 
 
 # Inicializar GPU al importar el módulo
 def _auto_init():
     """Auto-inicialización al importar."""
-    fix_cuda_dll_paths()
-    info = detect_cuda_gpu()
-    if info["cuda_available"]:
-        force_cuda_gpu()
-        print(f"[GPU] Forzando uso de GPU: {info['gpu_names'][info['preferred_gpu_id']]}")
-    else:
-        print("[GPU] No se detectó GPU NVIDIA, usando CPU")
-
+    try:
+        fix_cuda_dll_paths()
+        info = detect_cuda_gpu()
+        if info["cuda_available"]:
+            force_cuda_gpu()
+            print(f"[GPU] Forzando uso de GPU: {info['gpu_names'][info['preferred_gpu_id']]}")
+        else:
+            print("[GPU] No se detectó GPU NVIDIA, usando CPU")
+    except Exception as e:
+        print(f"[GPU] Error en inicialización: {e}")
+    finally:
+        print("[GPU] Inicialización terminada.")
 
 # Ejecutar auto-inicialización
 _auto_init()

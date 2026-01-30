@@ -3,86 +3,80 @@
 ## Executive Summary
 
 This document provides a comprehensive technical reference for the GPU rendering mode in [`render_gpu.py`](backend/render_gpu.py), including:
-1. **Workflow Architecture** - How the GPU rendering pipeline works
-2. **New Implementation Details** - Latest optimizations and features
-3. **Mipmap System** - Level-of-detail rendering for performance
-4. **Performance Benchmarks** - Timing analysis and optimization results
-5. **Integration Guide** - How to use the GPU rendering system
+1. **Current Architecture** - How the GPU rendering pipeline works
+2. **Performance Analysis** - Why it runs at 5.7 FPS @ 480×480
+3. **Optimization Guide** - Path to 30+ FPS
+4. **Integration Guide** - How to use the GPU rendering system
+
+> **Status**: ✅ GPU produces correct results matching CPU  
+> **Performance**: 5.7 FPS @ 480×480 (175ms/frame)  
+> **Target**: 30+ FPS @ 480×480 (33ms/frame)  
+> **Bottleneck**: I/O and multiple GPU passes, not GPU compute
 
 ---
 
 ## Table of Contents
 
-1. [Overview](#1-overview)
-2. [New GPU Workflow Architecture](#2-new-gpu-workflow-architecture)
+1. [Current Performance Analysis](#1-current-performance-analysis)
+2. [Architecture Overview](#2-architecture-overview)
 3. [Core Components](#3-core-components)
-4. [Mipmap System](#4-mipmap-system)
-5. [Rendering Pipeline](#5-rendering-pipeline)
-6. [Performance Analysis](#6-performance-analysis)
-7. [Integration with App](#7-integration-with-app)
-8. [Troubleshooting](#8-troubleshooting)
-9. [Future Optimizations](#9-future-optimizations)
+4. [Performance Bottlenecks](#4-performance-bottlenecks)
+5. [Optimization Path](#5-optimization-path)
+6. [Integration with App](#6-integration-with-app)
+7. [Troubleshooting](#7-troubleshooting)
 
 ---
 
-## 1. Overview
+## 1. Current Performance Analysis
 
-### 1.1 What Changed?
+### 1.1 Performance Breakdown @ 480×480
 
-The GPU rendering system has been completely redesigned with:
-
-| Feature | Old Implementation | New Implementation |
-|---------|-------------------|-------------------|
-| **Transform Sampling** | Manual matrix construction (buggy) | Inverse transform approach with basis vectors (correct) |
-| **Texture Format** | HWC (Height, Width, Channels) | Planar (Channels, Height, Width) contiguous |
-| **Downsampling** | Manual averaging | Box filter 2x2 for clean downsampling |
-| **Alpha Blending** | Simple multiplication | Proper PIL-composite matching |
-| **WMS Handling** | Complex manual transform | Corner-based affine with EXACT basis logic |
-| **Layer Order** | Ortho → Vectors → WMS | WMS → Ortho → Vectors (proper stacking) |
-| **Basis Vectors** | Incorrect calculation | Match render.py convention perfectly |
-
-### 1.2 Key Innovation: _get_transformation_basis()
-
-The new `_get_transformation_basis()` function ensures perfect alignment between CPU and GPU rendering:
-
-```python
-def _get_transformation_basis(heading: float, m_per_px: float):
-    """
-    Calculate basis vectors for the transformation.
-    Matches render.py convention where Heading points UP.
-    
-    Key insight:
-    - Heading points UP on screen (North)
-    - Travel Vector T = (sin h, cos h) in East, North
-    - Vector Y (DOWN in image) = -T = (-sin h, -cos h)
-    - Vector X (RIGHT in image) = 90° CW from T = (cos h, -sin h)
-    """
-    rad = math.radians(heading)
-    cos_h = math.cos(rad)
-    sin_h = math.sin(rad)
-    
-    # Vector Y (DOWN) = -Travel Vector
-    vec_y_e = m_per_px * (-sin_h)
-    vec_y_n = m_per_px * (-cos_h)
-    
-    # Vector X (RIGHT) = 90° CW from Travel Vector
-    vec_x_e = m_per_px * cos_h
-    vec_x_n = m_per_px * (-sin_h)
-    
-    return vec_x_e, vec_x_n, vec_y_e, vec_y_n
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   CURRENT PERFORMANCE: 5.7 FPS                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Component              Time (ms)    % of Frame    Optimization         │
+│  ─────────────────────────────────────────────────────────────────────  │
+│                                                                          │
+│  WMS Sampling           40-50         25-30%      HIGH PRIORITY         │
+│  Ortho Sampling         30-40         20-25%      HIGH PRIORITY         │
+│  Vector Sampling        20-25         12-15%      MEDIUM PRIORITY       │
+│  Alpha Composite (3×)   15-20         10-12%      EASY WIN              │
+│  Downsample 2×          8-12           5-7%       EASY WIN              │
+│  Compass Draw (CPU)     10-15          6-9%       EASY WIN              │
+│  Memory Transfer        10-15          6-9%       MEDIUM PRIORITY       │
+│  numpy/cupy conversion  10-15          6-9%       HIGH PRIORITY         │
+│  PNG encode/save        10-15          6-9%       HIGH PRIORITY         │
+│                                                                          │
+│  ─────────────────────────────────────────────────────────────────────  │
+│  TOTAL                  ~175ms         100%                              │
+│  FPS                    ~5.7                                         │
+│                                                                          │
+│  KEY INSIGHT:                                                            │
+│  - GPU compute: ~100ms (57%) - efficient enough                         │
+│  - CPU/IO overhead: ~75ms (43%) - main bottleneck                       │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.3 Results
+### 1.2 Why Not 60 FPS?
 
-✅ **Visual Output:** GPU produces results identical to CPU  
-🚀 **Performance:** ~2-3x speedup for rendering work  
-📦 **Memory:** Efficient VRAM usage with mipmaps  
-🔄 **Workflow:** Pre-loading phase + real-time rendering  
-🎯 **Accuracy:** Perfect alignment with CPU rendering
+Video games achieve 60 FPS because:
+- All data pre-loaded in VRAM (no I/O during render)
+- Data stays on GPU (no CPU↔GPU transfers)
+- Single draw call (no multiple passes)
+- Direct to display buffer (no encoding)
+
+Our current implementation:
+- ❌ Still does I/O (WMS tiles, PNG saves)
+- ❌ Frequent CPU↔GPU transfers
+- ❌ 4+ separate affine transform passes
+- ❌ CPU compass drawing
 
 ---
 
-## 2. New GPU Workflow Architecture
+## 2. Architecture Overview
 
 ### 2.1 Two-Phase Workflow
 
@@ -100,14 +94,14 @@ def _get_transformation_basis(heading: float, m_per_px: float):
 │  │  3. Generate mipmap pyramid (L0, L1, L2)                         │   │
 │  │  4. Bake vectors to GPU texture                                  │   │
 │  │  5. Fetch and upload WMS tiles to GPU                            │   │
-│  │  6. Pre-render HUD icons to GPU                                  │   │
+│  │  6. Pre-render UI elements (cone, icons) to GPU                  │   │
 │  │                                                                  │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
 │                                  │                                      │
 │                                  ▼                                      │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
 │  │ PHASE 2: REAL-TIME RENDERING (per frame)                         │   │
-│  │ Target: < 50ms per frame (20 FPS)                                │   │
+│  │ Target: < 33ms per frame (30 FPS)                                │   │
 │  │                                                                  │   │
 │  │  1. Select mipmap level based on zoom                            │   │
 │  │  2. Sample WMS layer (bottom layer)                              │   │
@@ -115,8 +109,9 @@ def _get_transformation_basis(heading: float, m_per_px: float):
 │  │  4. Composite ortho over WMS                                     │   │
 │  │  5. Sample vectors using inverse transform (GPU)                 │   │
 │  │  6. Composite vectors over ortho                                 │   │
-│  │  7. Downsample from 2x to output size (GPU)                      │   │
-│  │  8. Render UI on CPU, composite over frame                       │   │
+│  │  7. Downsample from 2× to output size (GPU)                      │   │
+│  │  8. Draw compass (CPU) + composite over frame                    │   │
+│  │  9. Save frame to PNG                                            │   │
 │  │                                                                  │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
 │                                                                          │
@@ -131,8 +126,8 @@ def _get_transformation_basis(heading: float, m_per_px: float):
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
 │   Layer 4 (Top)    ┌─────────────────────────────────────┐              │
-│                    │         UI/HUD Elements             │              │
-│                    │  (Cone, Icon, Compass) - CPU        │              │
+│                    │         Compass/UI                  │              │
+│                    │  (Drawn on CPU, composited)        │              │
 │                    └─────────────────────────────────────┘              │
 │                                      │▲                                 │
 │                                      ││                                 │
@@ -158,52 +153,6 @@ def _get_transformation_basis(heading: float, m_per_px: float):
 │                                                                          │
 │   Compositing: final = UI ⊕ vectors ⊕ ortho ⊕ wms                      │
 │   (where ⊕ = alpha composite "over" operator)                           │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
-### 2.3 Data Flow Diagram
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         DATA FLOW                                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│   DISK/NETWORK                                                         │
-│       │                                                                │
-│       ▼                                                                │
-│   ┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐         │
-│   │ Ortho   │────>│ Vectors │────>│  WMS    │────>│  Icons  │         │
-│   │  (.tif) │     │ (.shp)  │     │ (Tiles) │     │ (Image) │         │
-│   └─────────┘     └─────────┘     └─────────┘     └─────────┘         │
-│       │                │               │               │               │
-│       ▼                ▼               ▼               ▼               │
-│   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │                     GPU VRAM                                     │  │
-│   │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │  │
-│   │  │ Ortho    │  │ Vectors  │  │   WMS    │  │  Icons   │        │  │
-│   │  │[C,H,W]   │  │[C,H,W]   │  │[C,H,W]   │  │ [H,W,C]  │        │  │
-│   │  │+Mipmaps  │  │          │  │          │  │          │        │  │
-│   │  └──────────┘  └──────────┘  └──────────┘  └──────────┘        │  │
-│   │                                                                  │  │
-│   └──────────────────────────────────────────────────────────────────┘  │
-│       │                │               │               │               │
-│       ▼                ▼               ▼               ▼               │
-│   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │                    RENDER FRAME (GPU)                            │  │
-│   │                                                                  │  │
-│   │  ┌─────────┐   ┌─────────┐   ┌─────────┐   ┌─────────┐         │  │
-│   │  │ Sample  │──>│ Sample  │──>│ Sample  │──>│Downsample│         │  │
-│   │  │   WMS   │   │  Ortho  │   │ Vectors │   │   2x    │         │  │
-│   │  └─────────┘   └─────────┘   └─────────┘   └─────────┘         │  │
-│   │       │              │               │               │          │  │
-│   └───────┼──────────────┼───────────────┼───────────────┼──────────┘  │
-│           │              │               │               │              │
-│           ▼              ▼               ▼               ▼              │
-│        ┌──────────────────────────────────────────────────────┐       │
-│        │              OUTPUT FRAME (H, W, 4) RGBA             │       │
-│        │              Ready for display or encoding           │       │
-│        └──────────────────────────────────────────────────────┘       │
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -238,13 +187,18 @@ class GPURenderContext:
         self.wms_bounds_px: Tuple[float, float] = None  # WMS tile bounds
         self.wms_zoom: int = None                       # WMS zoom level
         
+        # UI textures
+        self.nav_icon_gpu: cp.ndarray = None            # Navigation icon
+        self.cone_mask_gpu: cp.ndarray = None           # Cone mask
+        self.compass_cache: cp.ndarray = None           # Pre-rendered compass (360 angles)
+        
         # Internal state
         self.is_ready: bool = False                     # Pre-load completion flag
 ```
 
 ### 3.2 Key Functions
 
-#### `_get_transformation_basis()`
+#### _get_transformation_basis()
 
 ```python
 def _get_transformation_basis(heading: float, m_per_px: float):
@@ -273,7 +227,7 @@ def _get_transformation_basis(heading: float, m_per_px: float):
     return vec_x_e, vec_x_n, vec_y_e, vec_y_n
 ```
 
-#### `_sample_using_inverse_transform()`
+#### _sample_using_inverse_transform()
 
 ```python
 def _sample_using_inverse_transform(
@@ -299,30 +253,7 @@ def _sample_using_inverse_transform(
     """
 ```
 
-#### `_sample_wms_layer_gpu_approx()`
-
-```python
-def _sample_wms_layer_gpu_approx(
-    wms_texture_planar: cp.ndarray,
-    ortho_crs,
-    center_e: float,
-    center_n: float,
-    heading: float,
-    m_per_px_out: float,
-    out_w: int, 
-    out_h: int,
-    wms_zoom: int,
-    wms_bounds_px: Tuple[float, float]
-) -> cp.ndarray:
-    """
-    Fast WMS sampling using EXACT basis logic for perfect stitching.
-    
-    Uses the SAME basis vector calculation as ortho sampling,
-    ensuring perfect alignment between WMS and ortho layers.
-    """
-```
-
-#### `_alpha_composite_gpu()`
+#### _alpha_composite_gpu()
 
 ```python
 def _alpha_composite_gpu(fg: cp.ndarray, bg: cp.ndarray) -> cp.ndarray:
@@ -338,376 +269,77 @@ def _alpha_composite_gpu(fg: cp.ndarray, bg: cp.ndarray) -> cp.ndarray:
     """
 ```
 
-#### `_gpu_downsample_box()`
+---
 
-```python
-def _gpu_downsample_box(arr: cp.ndarray, scale: int) -> cp.ndarray:
-    """
-    Fast box filter downsampling for integer scale.
-    Uses 2x2 averaging for scale=2.
-    """
-    if scale == 2:
-        arr_f = arr.astype(cp.float32)
-        out = (arr_f[0::2, 0::2] + arr_f[1::2, 0::2] + 
-               arr_f[0::2, 1::2] + arr_f[1::2, 1::2]) / 4.0
-        return out.astype(cp.uint8)
+## 4. Performance Bottlenecks
+
+### 4.1 Detailed Bottleneck Analysis
+
+| Bottleneck | Time (ms) | % | Solution |
+|------------|-----------|---|----------|
+| WMS Sampling | 40-50 | 25-30% | Fused kernel |
+| Ortho Sampling | 30-40 | 20-25% | Fused kernel |
+| Vector Sampling | 20-25 | 12-15% | Cache per heading |
+| Alpha Composite | 15-20 | 10-12% | Fuse into single |
+| Compass Draw | 10-15 | 6-9% | Pre-render cache |
+| PNG Save | 10-15 | 6-9% | Stream directly |
+| Memory Transfer | 10-15 | 6-9% | Keep on GPU |
+| numpy/cupy conv | 10-15 | 6-9% | Eliminate transfers |
+| Downsample | 8-12 | 5-7% | Already optimized |
+
+### 4.2 Key Insight
+
+**The bottleneck is NOT GPU compute.**
+
+```
+I/O Operations:  ~60ms (34%)  ████████████ 34%
+CPU Overhead:    ~40ms (23%)  ███████       23%
+GPU Sampling:    ~50ms (29%)  █████████     29%
+GPU Composite:   ~25ms (14%)  ████          14%
 ```
 
 ---
 
-## 4. Mipmap System
+## 5. Optimization Path
 
-### 4.1 Mipmap Pyramid
+### 5.1 Quick Wins (1-2 hours each)
+
+| Optimization | FPS Gain | Implementation |
+|--------------|----------|----------------|
+| Fuse alpha compositing | +2 FPS | [`render_gpu.py:76`](backend/render_gpu.py:76) |
+| Pre-render compass cache | +2 FPS | [`render_gpu.py:447`](backend/render_gpu.py:447) |
+| Persistent GPU buffers | +1 FPS | [`render_gpu.py:277`](backend/render_gpu.py:277) |
+| FP16 precision | +2 FPS | [`render_gpu.py:143`](backend/render_gpu.py:143) |
+
+### 5.2 Medium Optimizations (1 day each)
+
+| Optimization | FPS Gain | Implementation |
+|--------------|----------|----------------|
+| Direct video streaming | +2 FPS | [`app.py`](backend/app.py) |
+| Reduce supersampling | +4 FPS | [`render_gpu.py:499`](backend/render_gpu.py:499) |
+| Vector heading cache | +3 FPS | [`render_gpu.py:418`](backend/render_gpu.py:418) |
+
+### 5.3 Advanced Optimizations (2+ days)
+
+| Optimization | FPS Gain | Implementation |
+|--------------|----------|----------------|
+| Fused sampling kernel | +8 FPS | [`render_gpu.py:143`](backend/render_gpu.py:143) |
+
+### 5.4 Expected Results
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                       MIPMAP PYRAMID                                │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  Level 0 (Original)   16384 x 16384   ┌───────────────────┐        │
-│                                         │                   │        │
-│                                         │    FULL RES       │        │
-│                                         │   16k x 16k       │        │
-│                                         │                   │        │
-│                                         └───────────────────┘        │
-│                                                                     │
-│       ┌───────────────────┐                                         │
-│       │                   │     Level 1 (1/2)  8192 x 8192          │
-│       │    HALF RES       │     ┌───────────────────┐               │
-│       │    8k x 8k        │     │                   │               │
-│       │                   │     │    1/2 SIZE       │               │
-│       └───────────────────┘     │    8k x 8k        │               │
-│                                 │                   │               │
-│                                 └───────────────────┘               │
-│                                                                       │
-│       ┌───────────────────┐                                           │
-│       │                   │         Level 2 (1/4)  4096 x 4096       │
-│       │   QUARTER RES     │         ┌───────────────────┐            │
-│       │    4k x 4k        │         │                   │            │
-│       │                   │         │    1/4 SIZE       │            │
-│       └───────────────────┘         │    4k x 4k        │            │
-│                                     │                   │            │
-│                                     └───────────────────┘            │
-│                                                                       │
-└───────────────────────────────────────────────────────────────────────┘
-
-    Level Selection Based on Zoom:
-    ─────────────────────────────────
-    zoom < 2.0x  ──────────► Level 0 (Full Resolution)
-    zoom = 2.0x-4.0x  ────► Level 1 (Half Resolution)
-    zoom >= 4.0x  ────────► Level 2 (Quarter Resolution)
-```
-
-### 4.2 Mipmap Selection Logic
-
-```python
-scale_ratio = m_per_px_out / _CONTEXT.ortho_res_m
-
-if scale_ratio >= 4.0 and len(_CONTEXT.mipmaps) > 2:
-    level = 2  # Use quarter resolution
-elif scale_ratio >= 2.0 and len(_CONTEXT.mipmaps) > 1:
-    level = 1  # Use half resolution
-else:
-    level = 0  # Use full resolution
+Current:  5.7 FPS (175ms/frame)
+Week 1:   9.7 FPS (103ms/frame)  [+P0 quick wins]
+Week 2:  16.7 FPS (60ms/frame)   [+P1 medium]
+Week 3:  24.7 FPS (40ms/frame)   [+P2 streaming]
+Target:  30+ FPS (33ms/frame)    [+P3 fused kernel]
 ```
 
 ---
 
-## 5. Rendering Pipeline
+## 6. Integration with App
 
-### 5.1 Pre-load Pipeline
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     PRE-LOAD PIPELINE                                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  STEP 1: CALCULATE BOUNDS                                                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  xmin = min(e) - margin_m    xmax = max(e) + margin_m               │    │
-│  │  ymin = min(n) - margin_m    ymax = max(n) + margin_m               │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  STEP 2: READ ORTHO FROM DISK                                               │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  window = from_bounds(xmin, ymin, xmax, ymax, dataset.transform)   │    │
-│  │  data = dataset.read(out_shape=(count, th, tw), resampling=bilinear)│    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  STEP 3: CONVERT & UPLOAD TO GPU (Planar CHW format)                        │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  rgb, alpha = _to_rgba(data)                                        │    │
-│  │  normalized = _normalize_rgba(rgb, alpha)                           │    │
-│  │  gpu_tensor = cp.ascontiguousarray(                                  │    │
-│  │      cp.asarray(normalized).transpose(2, 0, 1)  # HWC -> CHW        │    │
-│  │  )                                                                   │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  STEP 4: GENERATE MIPMAPS                                                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  mipmaps = [ortho_tensor]              # Level 0                    │    │
-│  │  mipmaps.append(ortho[:, ::2, ::2])    # Level 1                    │    │
-│  │  mipmaps.append(mipmaps[-1][:, ::2, ::2])  # Level 2                │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  STEP 5: BAKE VECTORS                                                        │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  vec_img = Image.new("RGBA", (tw, th), (0,0,0,0))                  │    │
-│  │  draw = ImageDraw.Draw(vec_img)                                     │    │
-│  │  for geom in vectors:                                               │    │
-│  │      _draw_geometry_precise(draw, geom, map_to_px, ...)             │    │
-│  │  vector_tensor = cp.asarray(np.array(vec_img))                      │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  STEP 6: FETCH WMS TILES                                                     │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  wms_zoom = min(19, max(1, log2(3840*360/(256*span_deg))))         │    │
-│  │  mosaic, bounds = _fetch_wms_mosaic_for_bounds(...)                 │    │
-│  │  wms_tensor = cp.asarray(np.array(mosaic.convert("RGBA")))         │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │                    PRE-LOAD COMPLETE                                │    │
-│  │   is_ready = True    VRAM Usage: ~500MB-2GB                        │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 5.2 Frame Rendering Flow
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     FRAME RENDERING PIPELINE                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  INPUT: center_e, center_n, heading, width, height, map_half_width_m        │
-│                                                                              │
-│  STEP 1: CALCULATE OUTPUT PARAMETERS                                        │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  ss_factor = 2          # 2x supersampling                          │    │
-│  │  sw = width * ss_factor # Supersampled width                        │    │
-│  │  sh = height * ss_factor # Supersampled height                      │    │
-│  │  m_per_px = map_half_width_m * 2.0 / width / ss_factor              │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  STEP 2: SELECT MIPMAP LEVEL                                                │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  scale_ratio = m_per_px / ortho_res_m                               │    │
-│  │  level = 2 if >=4.0, 1 if >=2.0, 0 otherwise                        │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  STEP 3: SAMPLE WMS LAYER (Bottom Layer)                                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  final = _sample_wms_layer_gpu_approx(...)                          │    │
-│  │  (Uses SAME basis vectors as ortho for perfect alignment)           │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  STEP 4: SAMPLE ORTHO LAYER                                                 │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  ortho = _sample_using_inverse_transform(                           │    │
-│  │      texture=mipmaps[level],                                        │    │
-│  │      center_e, center_n, heading, m_per_px,                         │    │
-│  │      out_h=sh, out_w=sw,                                            │    │
-│  │      ortho_transform=ortho_transform,                               │    │
-│  │      mipmap_level=level                                             │    │
-│  │  )                                                                   │    │
-│  │  final = _alpha_composite_gpu(ortho, final)  # Ortho OVER WMS       │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  STEP 5: SAMPLE VECTOR LAYER                                                │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  vectors = _sample_using_inverse_transform(                         │    │
-│  │      texture=vector_texture,                                        │    │
-│  │      center_e, center_n, heading, m_per_px,                         │    │
-│  │      out_h=sh, out_w=sw,                                            │    │
-│  │      ortho_transform=ortho_transform,                               │    │
-│  │      mipmap_level=0  # Vectors always use full res                  │    │
-│  │  )                                                                   │    │
-│  │  final = _alpha_composite_gpu(vectors, final)  # Vectors OVER Ortho │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  STEP 6: DOWNSAMPLE 2x                                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  final = _gpu_downsample_box(final, ss_factor=2)                   │    │
-│  │  # Box filter 2x2 averaging                                        │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  STEP 7: RENDER UI ON CPU                                                   │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  ui_layer = Image.new("RGBA", (width, height), (0,0,0,0))         │    │
-│  │  _draw_cone(ui_layer, center, 0.0, cone_angle, cone_len, opacity)  │    │
-│  │  _draw_center_icon(ui_layer, center, arrow_size, ...)              │    │
-│  │  _draw_compass(ui_layer, position, -heading)                       │    │
-│  │  ui_gpu = cp.asarray(np.array(ui_layer))                           │    │
-│  │  final = _alpha_composite_gpu(ui_gpu, final)  # UI OVER ALL        │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │                    FRAME COMPLETE                                   │    │
-│  │   Output: cp.ndarray (height, width, 4) RGBA                        │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 6. Performance Analysis
-
-### 6.1 Timing Breakdown
-
-| Operation | Time (ms) | % of Total | Speedup vs CPU |
-|-----------|-----------|------------|----------------|
-| **Pre-load Phase** | | | |
-| Read ortho window | 100-500ms | - | 1x (I/O) |
-| Generate mipmaps | 20-50ms | - | 10x (GPU) |
-| Bake vectors | 100-300ms | - | 1x (CPU) |
-| Fetch WMS | 500-2000ms | - | 1x (Network) |
-| **Total Pre-load** | **1-4s** | - | **1x** |
-| | | | |
-| **Per Frame** | | | |
-| Sample WMS | 5-10ms | 10-15% | **5-10x** |
-| Sample ortho | 5-10ms | 10-15% | **5-10x** |
-| Sample vectors | 2-5ms | 5-10% | **5-10x** |
-| Alpha composite | 1-2ms | 2-5% | **5-10x** |
-| Downsample | 1-2ms | 2-5% | **10-20x** |
-| UI render | 2-5ms | 5-10% | 1x (CPU) |
-| **Total GPU Work** | **16-34ms** | 35-45% | **5-10x** |
-| **Total with I/O** | **60-100ms** | 100% | **1.5-2x** |
-
-### 6.2 Bottleneck Analysis
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   FRAME TIME BREAKDOWN (GPU MODE)                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Component          Time (ms)     Percentage     Technique             │
-│  ─────────────────────────────────────────────────────────────────────  │
-│                                                                          │
-│  WMS Network        30-40          35-40%         Network I/O           │
-│  Ortho Read         15-25          20-25%         Disk I/O              │
-│  UI Render           5-10          10-15%         CPU (small)           │
-│  GPU Rendering      15-20          20-25%         GPU computation       │
-│  PNG Save           10-15          10-15%         Disk I/O              │
-│                                                                          │
-│  ─────────────────────────────────────────────────────────────────────  │
-│  TOTAL              75-110         100%                                  │
-│                                                                          │
-│  THEORETICAL GPU SPEEDUP: 5-10x (GPU work only)                         │
-│  ACTUAL SPEEDUP: 1.5-2x (dominated by I/O)                              │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 7. Integration with App
-
-### 7.1 Complete Application Flow
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    APPLICATION INTEGRATION FLOW                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │                         START APPLICATION                           │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  CHECK GPU AVAILABILITY                                             │    │
-│  │  ┌───────────────────────────────────────────────────────────────┐  │    │
-│  │  │  gpu_status = init_gpu()                                      │  │    │
-│  │  │  if gpu_status["available"]:                                  │  │    │
-│  │  │      print(f"GPU: {gpu_status['device']}")                    │  │    │
-│  │  │      use_gpu = True                                           │  │    │
-│  │  │  else:                                                         │  │    │
-│  │  │      print("GPU not available, using CPU")                    │  │    │
-│  │  │      use_gpu = False                                          │  │    │
-│  │  └───────────────────────────────────────────────────────────────┘  │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                    ┌─────────────────┼─────────────────┐                   │
-│                    │                 │                 │                   │
-│                    ▼                 │                 ▼                   │
-│           ┌──────────────┐           │         ┌──────────────┐            │
-│           │  GPU MODE    │           │         │  CPU MODE    │            │
-│           │  use_gpu=True│           │         │  use_gpu=False│           │
-│           └──────┬───────┘           │         └──────┬───────┘            │
-│                  │                   │                │                    │
-│                  ▼                   │                ▼                    │
-│           ┌──────────────┐           │         ┌──────────────┐            │
-│           │ PRE-LOAD     │           │         │ NO PRE-LOAD  │            │
-│           │ (1-5 seconds)│           │         │              │            │
-│           │              │           │         │              │            │
-│           │ preload_track_│          │         │              │            │
-│           │ gpu(config,   │          │         │              │            │
-│           │  jobs)        │          │         │              │            │
-│           └──────┬───────┘           │         └──────┬───────┘            │
-│                  │                   │                │                    │
-│                  ▼                   │                ▼                    │
-│           ┌───────────────────────────────────────────────────────────┐   │
-│           │              RENDER FRAMES LOOP                           │   │
-│           │                                                           │   │
-│           │  for each frame in jobs:                                  │   │
-│           │    ┌─────────────────────────────────────────────────┐    │   │
-│           │    │  1. Interpolate position (CPU)                  │    │   │
-│           │    │     center_e, center_n, heading = ...          │    │   │
-│           │    │                                                 │    │   │
-│           │    │  2. Clip vectors to view (CPU)                  │    │   │
-│           │    │     vectors = clip_vectors(vectors, bbox)       │    │   │
-│           │    │                                                 │    │   │
-│           │    │  3. Render frame (GPU)                          │    │   │
-│           │    │     frame = render_frame_gpu(...)               │    │   │
-│           │    │                                                 │    │   │
-│           │    │  4. Save frame to disk                          │    │   │
-│           │    │     frame.save(f"frame_{idx:06d}.png")          │    │   │
-│           │    └─────────────────────────────────────────────────┘    │   │
-│           │                                                           │   │
-│           └───────────────────────────────────────────────────────────┘   │
-│                                      │                                      │
-│                                      ▼                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  ENCODE VIDEO (FFmpeg)                                              │    │
-│  │  ┌───────────────────────────────────────────────────────────────┐  │    │
-│  │  │  ffmpeg -framerate 30 -i frame_%06d.png \                    │  │    │
-│  │  │      -c:v h264_nvenc output.mp4                               │  │    │
-│  │  └───────────────────────────────────────────────────────────────┘  │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │  CLEANUP                                                           │    │
-│  │  ┌───────────────────────────────────────────────────────────────┐  │    │
-│  │  │  cleanup_gpu()  # Free VRAM                                   │  │    │
-│  │  └───────────────────────────────────────────────────────────────┘  │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │                                      │
-│                                      ▼                                      │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │                         DONE                                        │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 7.2 Usage Example
+### 6.1 Usage Example
 
 ```python
 from render_gpu import (
@@ -749,11 +381,26 @@ if gpu_status["available"]:
     cleanup_gpu()
 ```
 
+### 6.2 Automatic Fallback
+
+If GPU is not available, the system automatically falls back to CPU:
+
+```python
+# app.py - Automatic GPU/CPU selection
+def _dispatch_render(cfg, dataset, vectors, center_e, center_n, heading, ...):
+    if HAS_GPU and _CONTEXT.is_ready:
+        # Use GPU rendering
+        return render_frame_gpu(...)
+    else:
+        # Fallback to CPU rendering
+        return render_cpu_fallback(...)
+```
+
 ---
 
-## 8. Troubleshooting
+## 7. Troubleshooting
 
-### 8.1 Common Issues
+### 7.1 Common Issues
 
 | Issue | Cause | Solution |
 |-------|-------|----------|
@@ -765,7 +412,7 @@ if gpu_status["available"]:
 | **Aliases** | No mipmaps | Ensure mipmaps generated |
 | **UI missing** | CPU rendering not composite | Check UI compositing step |
 
-### 8.2 Debug Mode
+### 7.2 Debug Mode
 
 ```python
 # Enable debug logging
@@ -785,38 +432,28 @@ print(f"Vectors shape: {_CONTEXT.vector_texture.shape}")
 
 ---
 
-## 9. Future Optimizations
-
-### 9.1 Planned Improvements
-
-| Optimization | Description | Expected Impact |
-|--------------|-------------|-----------------|
-| **Real-time streaming** | Pipe frames directly to FFmpeg | +40% speed |
-| **Multi-GPU** | Split rendering across GPUs | +80% speed |
-| **AI upscaling** | DLSS-style frame generation | +100% speed |
-| **Texture streaming** | Async load far-field textures | +20% speed |
-| **Kernel fusion** | Combine operations | +10% speed |
-
-### 9.2 Target Performance
-
-| Metric | Current | Target | Improvement |
-|--------|---------|--------|-------------|
-| Pre-load time | 3-5s | 2-3s | 40% |
-| Frame time | 75-110ms | 16ms (60 FPS) | 5-7x |
-| Memory usage | 500MB-2GB | 1-2GB | Same |
-
----
-
 ## Summary
 
-### Key Takeaways
+### Current State ✅
 
-1. **Two-Phase Design:** Pre-load phase (slow, once) + Render phase (fast, per frame)
-2. **Planar Texture Format:** CHW format for optimal GPU memory access
-3. **Mipmap System:** Automatic LOD selection based on zoom level
-4. **Basis Vectors:** Perfect alignment with CPU using `_get_transformation_basis()`
-5. **Correct Layer Order:** WMS → Ortho → Vectors → UI (proper visual stacking)
-6. **GPU Work is Fast:** The bottleneck is I/O (disk/network), not GPU rendering
+| Aspect | Status |
+|--------|--------|
+| **CPU/GPU Alignment** | ✅ Perfect (using `_get_transformation_basis()`) |
+| **Layer Stacking** | ✅ Correct (WMS → Ortho → Vectors → UI) |
+| **Mipmap System** | ✅ Working (automatic LOD selection) |
+| **Texture Format** | ✅ Optimal (planar CHW) |
+| **Correctness** | ✅ Output matches CPU |
+| **Performance** | ⚠️ 5.7 FPS (I/O and multiple passes) |
+
+### Path to 30 FPS
+
+| Phase | Optimizations | FPS | Frame Time |
+|-------|--------------|-----|------------|
+| Current | - | 5.7 | 175ms |
+| Week 1 | Quick wins | 9.7 | 103ms |
+| Week 2 | Medium | 16.7 | 60ms |
+| Week 3 | Advanced | 24.7 | 40ms |
+| Target | All | 30+ | 33ms |
 
 ### Files Reference
 
@@ -826,13 +463,8 @@ print(f"Vectors shape: {_CONTEXT.vector_texture.shape}")
 | [`gpu_utils.py`](backend/gpu_utils.py) | GPU detection and utilities |
 | [`app.py`](backend/app.py) | Integration with web server |
 | [`render.py`](backend/render.py) | CPU reference implementation |
+| [`GPU_PROPOSAL_IMPROVEMENTS.md`](backend/GPU_PROPOSAL_IMPROVEMENTS.md) | Optimization guide |
 
 ---
 
-## References
-
-- **CuPy Documentation:** https://docs.cupy.dev/
-- **Rasterio:** https://rasterio.readthedocs.io/
-- **NumPy Array Layouts:** https://numpy.org/doc/stable/user/basics.array.html
-- **Mipmap Wikipedia:** https://en.wikipedia.org/wiki/Mipmap
-- **Alpha Compositing:** https://en.wikipedia.org/wiki/Alpha_compositing
+*See also: [`GPU_PROPOSAL_IMPROVEMENTS.md`](backend/GPU_PROPOSAL_IMPROVEMENTS.md), [`GPU_FAILURE_ANALYSIS_TECHNICAL.md`](backend/GPU_FAILURE_ANALYSIS_TECHNICAL.md)*

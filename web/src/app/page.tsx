@@ -136,7 +136,7 @@ type SaveFilePickerOptions = {
 type ShowSaveFilePicker = (options?: SaveFilePickerOptions) => Promise<FileSystemFileHandle>;
 
 // ==================== CONSTANTS ====================
-const API = "http://127.0.0.1:8000";
+const API = "http://localhost:8000";
 const DEFAULT_LAYER_COLORS = ["#EF0B85", "#616161", "#47AFFF", "#ffd166", "#d36cff", "#00d1b2"];
 const DEFAULT_LINE_COLOR = "#29b3ff";
 const DEFAULT_LINE_WIDTH = 3;
@@ -615,12 +615,16 @@ export default function Home() {
         const data = await res.json();
         if (!alive) return;
         setJobStatus(data);
-        if (data.status === "finished" && data.output_path) {
-          setMinimapExportPath(data.output_path);
-          setShowVideoModal(true);
+
+        // Stop polling if job is done, errored, not found or cancelled
+        if (["finished", "error", "not_found", "cancelled", "failed"].includes(data.status)) {
+          if (data.status === "finished" && data.output_path) {
+            setMinimapExportPath(data.output_path);
+            setShowVideoModal(true);
+          }
           return;
         }
-        if (data.status === "error" || data.status === "not_found") return;
+
         setTimeout(poll, 1000);
       } catch {
         setTimeout(poll, 1500);
@@ -641,16 +645,19 @@ export default function Home() {
         const data = await res.json();
         if (!alive) return;
         setPathJobStatus(data);
-        if (data.status === "finished" && data.track_path) {
-          setTrackPath(data.track_path);
-          const trackRes = await fetch(`${API}/file?path=${encodeURIComponent(data.track_path)}`);
-          if (trackRes.ok) {
-            const trackJson = await trackRes.json();
-            if (alive) setTrackData(trackJson);
+
+        if (["finished", "error", "not_found", "cancelled", "failed"].includes(data.status)) {
+          if (data.status === "finished" && data.track_path) {
+            setTrackPath(data.track_path);
+            const trackRes = await fetch(`${API}/file?path=${encodeURIComponent(data.track_path)}`);
+            if (trackRes.ok) {
+              const trackJson = await trackRes.json();
+              if (alive) setTrackData(trackJson);
+            }
           }
           return;
         }
-        if (data.status === "error" || data.status === "not_found") return;
+
         setTimeout(poll, 1000);
       } catch {
         setTimeout(poll, 1500);
@@ -671,11 +678,14 @@ export default function Home() {
         const data = await res.json();
         if (!alive) return;
         setOverlayJobStatus(data);
-        if (data.status === "finished" && data.output_path) {
-          setExportPath(data.output_path);
+
+        if (["finished", "error", "not_found", "cancelled", "failed"].includes(data.status)) {
+          if (data.status === "finished" && data.output_path) {
+            setExportPath(data.output_path);
+          }
           return;
         }
-        if (data.status === "error" || data.status === "not_found") return;
+
         setTimeout(poll, 1000);
       } catch {
         setTimeout(poll, 1500);
@@ -834,6 +844,11 @@ export default function Home() {
         }
       };
       xhr.onerror = () => reject(new Error("No se pudo subir el archivo"));
+
+      // Set timeout to 60 seconds (large files might need time, but infinite is bad)
+      xhr.timeout = 60000;
+      xhr.ontimeout = () => reject(new Error("Tiempo de espera agotado (Timeout)"));
+
       const form = new FormData();
       form.append("file", file);
       xhr.send(form);
@@ -1309,6 +1324,9 @@ export default function Home() {
     } catch (err) {
       console.error(err);
       alert("Error al intentar cancelar.");
+    } finally {
+      setJobId(null);
+      setJobStatus(null);
     }
   };
 
@@ -1368,7 +1386,7 @@ export default function Home() {
       settings: {
         fps, width, height, mapHalfWidth, mapZoomFactor, arrowSize, iconCircleSize,
         coneAngle, coneLength, coneOpacity, iconCircleOpacity, showCompass, compassSize,
-        outputName, wmsSource
+        outputName, wmsSource, useGpu
       },
       ortho: {
         ref: orthoRef,
@@ -1399,7 +1417,17 @@ export default function Home() {
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
-        const project = JSON.parse(ev.target?.result as string);
+        const text = ev.target?.result as string;
+        if (!text) throw new Error("Archivo vacío");
+        const project = JSON.parse(text);
+
+        // Reset non-serializable states that shouldn't persist across projects
+        setMinimapSaveHandle(null);
+        setMinimapSaveName(null);
+        setMinimapSaveError(null);
+        setJobId(null);
+        setJobStatus(null);
+
         if (project.settings) {
           setFps(project.settings.fps ?? 30);
           setWidth(project.settings.width ?? 640);
@@ -1415,12 +1443,11 @@ export default function Home() {
           setShowCompass(project.settings.showCompass ?? true);
           setCompassSize(project.settings.compassSize ?? 40);
           setOutputName(project.settings.outputName ?? "minimapa.mp4");
-          // Restore wmsSource or default to hybrid
           setWmsSource(project.settings.wmsSource || "google_hybrid");
+          setUseGpu(project.settings.useGpu ?? false);
         }
 
         if (project.ortho) {
-          // Handle different possible structures of ortho object
           const ref = project.ortho.ref || null;
           const metadata = project.ortho.metadata || null;
 
@@ -1430,26 +1457,40 @@ export default function Home() {
           setNaturalSize(project.ortho.naturalSize || { width: 0, height: 0 });
 
           if (ref && ref.path) {
-            // Regenerate URLs for current session
             const currentWmsSource = project.settings?.wmsSource || "google_hybrid";
             setOrthoImageUrl(`${API}/ortho-preview?path=${encodeURIComponent(ref.path)}`);
             setWmsImageUrl(`${API}/ortho-wms-preview?path=${encodeURIComponent(ref.path)}&source=${currentWmsSource}`);
           } else {
             setOrthoImageUrl(null);
-            // Default WMS view
             const currentWmsSource = project.settings?.wmsSource || "google_hybrid";
             setWmsImageUrl(`${API}/ortho-wms-preview?source=${currentWmsSource}&bounds=${encodeURIComponent("-79.13,-4.23,-66.85,13.39")}`);
           }
+        } else {
+          // Reset ortho if missing in project
+          setOrthoRef(null);
+          setOrthoMetadata(null);
+          setOrthoImageUrl(null);
+          setBaseLayer("wms");
         }
-        if (project.routePoints) setRoutePoints(project.routePoints);
+
+        if (project.routePoints) {
+          setRoutePoints(project.routePoints);
+        } else {
+          setRoutePoints([]);
+        }
+
         if (project.vectorInputs) {
           setVectorInputs(project.vectorInputs.map((v: any) => ({
             ...v, file: null, uploading: false, error: null
           })));
+        } else {
+          setVectorInputs(createDefaultVectorInputs());
         }
+
         setAppPhase("editor");
       } catch (err) {
-        alert("Error al cargar el proyecto: Archivo inválido.");
+        console.error("Load project error:", err);
+        alert(`Error al cargar el proyecto: ${err instanceof Error ? err.message : "Archivo inválido"}`);
       }
     };
     reader.readAsText(file);
