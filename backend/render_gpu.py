@@ -1,4 +1,4 @@
-
+import os
 import math
 import logging
 import io
@@ -183,7 +183,10 @@ def _sample_using_inverse_transform(
     offset = cp.array([off_r, off_c], dtype=cp.float32)
 
     # 4. Transform
-    result_planar = cp.zeros((4, out_h, out_w), dtype=cp.uint8)
+    # 4. Transform
+    # Reuse buffer to avoid allocation
+    result_planar = _CONTEXT._get_planar_buffer((4, out_h, out_w), dtype=cp.uint8)
+    
     for i in range(4):
         ndimage.affine_transform(
             texture_planar[i],
@@ -191,13 +194,15 @@ def _sample_using_inverse_transform(
             offset=offset,
             output_shape=(out_h, out_w),
             output=result_planar[i],
-            order=1,
+            order=1, # Linear is faster and sufficient
             mode='constant',
             cval=0,
             prefilter=False
         )
         
-    return cp.transpose(result_planar, (1, 2, 0))
+    # Standard transpose (no strided trick yet to avoid breaking)
+    # This creates a copy, but we saved the input buffer allocation.
+    return cp.ascontiguousarray(cp.transpose(result_planar, (1, 2, 0)))
 
 def _sample_wms_layer_gpu_approx(
     wms_texture_planar: cp.ndarray,
@@ -260,7 +265,8 @@ def _sample_wms_layer_gpu_approx(
     offset = cp.array([y0, x0], dtype=cp.float32)
     
     # 5. Transform
-    result_planar = cp.zeros((4, out_h, out_w), dtype=cp.uint8)
+    # 5. Transform
+    result_planar = _CONTEXT._get_planar_buffer((4, out_h, out_w), dtype=cp.uint8)
     for i in range(4):
         chan = wms_texture_planar[i] if i < wms_texture_planar.shape[0] else cp.full(wms_texture_planar.shape[1:], 255, dtype=cp.uint8)
         ndimage.affine_transform(
@@ -268,7 +274,7 @@ def _sample_wms_layer_gpu_approx(
             output=result_planar[i], order=1, mode='constant', cval=0, prefilter=False
         )
         
-    return cp.transpose(result_planar, (1, 2, 0))
+    return cp.ascontiguousarray(cp.transpose(result_planar, (1, 2, 0)))
 
 
 # --- Main Rendering Context ---
@@ -285,6 +291,29 @@ class GPURenderContext:
         self.wms_bounds_px = None 
         self.wms_zoom = None
         self.is_ready = False
+        
+        self._planar_buffer: Optional[cp.ndarray] = None
+        
+        # Identity tracking for Preview optimization
+        self.last_ortho_path = None
+        self.last_csv_path = None
+        self.last_vector_config = None
+        self.last_wms_source = None
+    
+    def _get_planar_buffer(self, shape: Tuple[int, int, int], dtype) -> cp.ndarray:
+        """Returns a reused buffer of at least the requested shape (4, H, W)."""
+        # Shape is usually (4, H, W)
+        req_size = shape[0] * shape[1] * shape[2] * cp.dtype(dtype).itemsize
+        
+        if (self._planar_buffer is None or 
+            self._planar_buffer.size * self._planar_buffer.itemsize < req_size):
+            # Allocate new with 20% margin to reduce re-allocations
+            alloc_mb = int(req_size * 1.2 / (1024*1024)) + 1
+            # print(f"[GPU] Allocating work buffer: ~{alloc_mb} MB")
+            self._planar_buffer = cp.zeros((shape[0], int(shape[1]*1.1), int(shape[2]*1.1)), dtype=dtype)
+        
+        # Return view of requested size
+        return self._planar_buffer[:shape[0], :shape[1], :shape[2]] 
         
         # P1-B: Cached Transformer for WMS
         self._wms_transformer: Optional[Transformer] = None
@@ -563,7 +592,11 @@ def render_frame_gpu(
         final_gpu = _alpha_composite_gpu(_CONTEXT._ui_icon_cone_cache, final_gpu)
 
     if show_compass:
-        if _CONTEXT._compass_cache is not None and _CONTEXT._compass_size == compass_size_px:
+        if _CONTEXT._compass_cache is None or _CONTEXT._compass_size != compass_size_px:
+             # Cache miss or resize: generate immediately
+             _CONTEXT._pre_render_compass_cache(compass_size_px)
+             
+        if _CONTEXT._compass_cache is not None:
             # P0-C: Use GPU Cache
             compass_gpu = _CONTEXT.get_compass_for_heading(heading)
             c_full_sz = _CONTEXT._compass_full_canvas_size
@@ -600,6 +633,11 @@ def preload_track_gpu(config: Any, jobs: List[Tuple], progress_callback=None) ->
             arrow_size=config.arrow_size_px, cone_len=config.cone_length_px, wms_source=config.wms_source,
             icon_opacity=getattr(config, 'icon_circle_opacity', 0.4), progress_callback=progress_callback
         )
+        # Store identity for preview optimization
+        _CONTEXT.last_ortho_path = os.path.normpath(config.ortho_path)
+        _CONTEXT.last_csv_path = os.path.normpath(config.csv_path)
+        _CONTEXT.last_vector_config = str(config.vector_layers) + str(config.vectors_paths)
+        _CONTEXT.last_wms_source = config.wms_source
 
 def cleanup_gpu():
     if _CONTEXT: _CONTEXT.clear()
