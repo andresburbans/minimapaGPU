@@ -294,6 +294,70 @@ class GPURenderContext:
         self._work_buffers_initialized = False
         self._composite_buffer: Optional[cp.ndarray] = None  # (max_h, max_w, 4)
         self._max_supersampled_size: Tuple[int, int] = (0, 0)
+        
+        # P0-C: Compass Cache
+        self._compass_cache: Optional[cp.ndarray] = None  # (360, size, size, 4)
+        self._compass_size: int = 0
+        self._compass_full_canvas_size: int = 0
+        
+        # P0-D: Nav UI Cache (Icon + Cone)
+        self._ui_icon_cone_cache: Optional[cp.ndarray] = None  # (H, W, 4)
+        self._ui_params: Dict[str, Any] = {}
+
+    def _pre_render_ui_elements_gpu(
+        self, width: int, height: int, 
+        arrow_size_px: int, cone_angle_deg: float, cone_length_px: int, 
+        cone_opacity: float, icon_circle_opacity: float, icon_circle_size_px: int
+    ):
+        """Pre-renders static UI elements (Icon and Cone) into a GPU buffer."""
+        params = {
+            "w": width, "h": height, "arrow": arrow_size_px, 
+            "c_angle": cone_angle_deg, "c_len": cone_length_px, 
+            "c_op": cone_opacity, "i_op": icon_circle_opacity, "i_sz": icon_circle_size_px
+        }
+        
+        if self._ui_icon_cone_cache is not None and self._ui_params == params:
+            return
+            
+        print(f"[GPU] Pre-renderizando Icono y Cono en GPU ({width}x{height})...")
+        ui_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        center_px = (width // 2, height // 2)
+        
+        if cone_opacity > 0:
+            _draw_cone(ui_img, center_px, 0.0, cone_angle_deg, cone_length_px, cone_opacity)
+        
+        _draw_center_icon(ui_img, center_px, arrow_size_px, icon_circle_opacity, icon_circle_size_px, 0.0)
+        
+        self._ui_icon_cone_cache = cp.asarray(np.array(ui_img))
+        self._ui_params = params
+
+    def _pre_render_compass_cache(self, compass_size: int):
+        """Pre-renders the compass for all 360 degrees into a GPU cache."""
+        if self._compass_cache is not None and self._compass_size == compass_size:
+            return
+            
+        # Full canvas size needs to accommodate labels and background circle
+        # Usually size * 2.5 is enough to avoid clipping text
+        canvas_sz = int(compass_size * 2.5)
+        if canvas_sz % 2 != 0: canvas_sz += 1 # Ensure even
+        
+        cache_cpu = np.zeros((360, canvas_sz, canvas_sz, 4), dtype=np.uint8)
+        center = (canvas_sz // 2, canvas_sz // 2)
+        
+        for h in range(360):
+            img = Image.new("RGBA", (canvas_sz, canvas_sz), (0, 0, 0, 0))
+            _draw_compass(img, center, compass_size, -float(h))
+            cache_cpu[h] = np.array(img)
+            
+        self._compass_cache = cp.asarray(cache_cpu)
+        self._compass_size = compass_size
+        self._compass_full_canvas_size = canvas_sz
+        print(f"[GPU] Cache de brújula generado: 360 rotaciones, tamaño {canvas_sz}x{canvas_sz}")
+
+    def get_compass_for_heading(self, heading: float) -> cp.ndarray:
+        """Returns the pre-rendered compass textures for the given heading."""
+        idx = int(round(heading)) % 360
+        return self._compass_cache[idx]
 
     def get_wms_transformer(self, ortho_crs) -> Transformer:
         """Obtains the transformer for WMS, caching it if possible."""
@@ -338,6 +402,9 @@ class GPURenderContext:
         self._wms_from_crs_str = None
         self._composite_buffer = None
         self._work_buffers_initialized = False
+        self._compass_cache = None
+        self._ui_icon_cone_cache = None
+        self._ui_params = {}
         self.is_ready = False
         import gc
         gc.collect()
@@ -417,6 +484,9 @@ class GPURenderContext:
             self.wms_bounds_px = ret_wms[1]
             self.wms_zoom = wms_zoom
             
+        notify(95, "Pre-renderizando Brújula...")
+        self._pre_render_compass_cache(40) # Default size, will re-cache if app requests different size
+        
         notify(100, "Precarga GPU completada.")
         self.is_ready = True
         return True
@@ -483,19 +553,37 @@ def render_frame_gpu(
     # Finalize
     final_gpu = _gpu_downsample_box(final_gpu, ss_factor)
     
-    # UI Overlay (CPU functions used for paraty, then uploaded)
-    ui_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    center_px = (width // 2, height // 2)
-    if cone_opacity > 0:
-        _draw_cone(ui_layer, center_px, 0.0, cone_angle_deg, cone_length_px, cone_opacity)
-    _draw_center_icon(ui_layer, center_px, arrow_size_px, icon_circle_opacity, icon_circle_size_px, 0.0)
+    # P0-D: Composite UI Elements from Cache
+    _CONTEXT._pre_render_ui_elements_gpu(
+        width, height, arrow_size_px, cone_angle_deg, cone_length_px, 
+        cone_opacity, icon_circle_opacity, icon_circle_size_px
+    )
+    
+    if _CONTEXT._ui_icon_cone_cache is not None:
+        final_gpu = _alpha_composite_gpu(_CONTEXT._ui_icon_cone_cache, final_gpu)
+
     if show_compass:
-        c_sz = max(15, compass_size_px)
-        c_pos = (width - (c_sz // 2 + 15), c_sz // 2 + 15)
-        _draw_compass(ui_layer, c_pos, c_sz, -heading)
-        
-    ui_gpu = cp.asarray(np.array(ui_layer))
-    return _alpha_composite_gpu(ui_gpu, final_gpu)
+        if _CONTEXT._compass_cache is not None and _CONTEXT._compass_size == compass_size_px:
+            # P0-C: Use GPU Cache
+            compass_gpu = _CONTEXT.get_compass_for_heading(heading)
+            c_full_sz = _CONTEXT._compass_full_canvas_size
+            
+            # Use same logic for margin
+            margin = 20
+            # Distance from edge to center in final frame
+            dist_x = int(compass_size_px * 1.1) + margin
+            dist_y = int(compass_size_px * 1.1) + margin
+            
+            # Coordinates for the top-left corner of the compass canvas
+            x0 = width - dist_x - (c_full_sz // 2)
+            y0 = dist_y - (c_full_sz // 2)
+            
+            # Boundary check
+            if x0 >= 0 and y0 >= 0 and x0 + c_full_sz <= width and y0 + c_full_sz <= height:
+                region = final_gpu[y0 : y0 + c_full_sz, x0 : x0 + c_full_sz, :]
+                final_gpu[y0 : y0 + c_full_sz, x0 : x0 + c_full_sz, :] = _alpha_composite_gpu(compass_gpu, region)
+    
+    return final_gpu
 
 def preload_track_gpu(config: Any, jobs: List[Tuple], progress_callback=None) -> None:
     if not HAS_GPU: return
