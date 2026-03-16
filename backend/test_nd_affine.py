@@ -1,43 +1,66 @@
 import cupy as cp
 import cupyx.scipy.ndimage as ndimage
-import numpy as np
+import time
 import os
 import sys
-sys.path.append(os.path.dirname(__file__))
-import gpu_utils
-gpu_utils.fix_cuda_dll_paths()
 
-def test_3d_affine():
-    # Create a 3D array (Channels, Height, Width)
-    data = cp.zeros((4, 100, 100), dtype=cp.uint8)
-    data[0, 10:20, 10:20] = 255 # Channel 0 has a square
-    data[1, 30:40, 30:40] = 128 # Channel 1 has a square
-    
-    # 2x2 Matrix (Rotation 45 deg)
-    matrix = cp.array([[0.707, -0.707], [0.707, 0.707]], dtype=cp.float32)
-    offset = cp.array([50, 50], dtype=cp.float32) # Offset for rows/cols
-    
-    print("Attempting 3D affine with 2D matrix...")
-    try:
-        # We want to transform only H, W. 
-        # offset should probably be 3D if input is 3D? Or just for the transformed axes?
-        # In current CuPy, if matrix is (2,2), it might error if input is 3D.
-        
-        # Test Case A: Matrix (2,2), Offset (2,)
-        res = ndimage.affine_transform(data, matrix, offset=offset, output_shape=(100, 100))
-        print("Success A: Result shape", res.shape)
-    except Exception as e:
-        print("Failed A:", e)
+# Simplified environment fix
+if os.name == 'nt':
+    dll_paths = [
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin",
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.x\bin",
+        os.path.join(os.path.dirname(sys.executable), "Lib", "site-packages", "cupy", ".data", "lib"),
+        os.path.join(os.path.dirname(sys.executable), "Lib", "site-packages", "cupy_backends", "cuda", "libs"),
+    ]
+    for p in dll_paths:
+        if os.path.exists(p):
+            os.add_dll_directory(p)
 
-    try:
-        # Test Case B: Using a 3x3 matrix where first dim is identity for channels
-        matrix3 = cp.eye(3)
-        matrix3[1:3, 1:3] = matrix
-        offset3 = cp.array([0, 50, 50])
-        res = ndimage.affine_transform(data, matrix3, offset=offset3)
-        print("Success B: Result shape", res.shape)
-    except Exception as e:
-        print("Failed B:", e)
+def test_strided_output():
+    H, W = 1080, 1920
+    texture_planar = cp.random.randint(0, 255, (4, H, W), dtype=cp.uint8)
+    
+    matrix = cp.array([[1.0, 0.0], [0.0, 1.0]], dtype=cp.float32)
+    offset = cp.array([0.0, 0.0], dtype=cp.float32)
+    
+    # 1. PLANAR ALLOCATION (Current Method)
+    start = time.time()
+    result_planar = cp.zeros((4, H, W), dtype=cp.uint8)
+    for i in range(4):
+        ndimage.affine_transform(
+            texture_planar[i], matrix, offset=offset, output_shape=(H, W),
+            output=result_planar[i], order=1, mode='constant', cval=0, prefilter=False
+        )
+    final_1 = cp.ascontiguousarray(cp.transpose(result_planar, (1, 2, 0)))
+    cp.cuda.Stream.null.synchronize()
+    msg_1 = f"Planar+Transpose:_ {time.time() - start:.6f}s"
+    print(msg_1)
+    
+    # 2. INTERLEAVED PRE-ALLOCATION (Strided Output)
+    start = time.time()
+    final_2 = cp.zeros((H, W, 4), dtype=cp.uint8) # C-contiguous (H, W, 4)
+    # final_2[:, :, 0] is strided!
+    for i in range(4):
+        ndimage.affine_transform(
+            texture_planar[i], matrix, offset=offset, output_shape=(H, W),
+            output=final_2[:, :, i], # STRIDED WRITE
+            order=1, mode='constant', cval=0, prefilter=False
+        )
+    cp.cuda.Stream.null.synchronize()
+    msg_2 = f"Direct Strided:__ {time.time() - start:.6f}s"
+    print(msg_2)
+    
+    # Check correctness
+    diff = cp.abs(final_1.astype(cp.float32) - final_2.astype(cp.float32)).sum()
+    print(f"Difference: {diff}")
+    
+    if diff == 0:
+        print("OPTIMIZATION VALID: Strided write works and is correct.")
+    else:
+        print("WARNING: Output mismatch.")
 
 if __name__ == "__main__":
-    test_3d_affine()
+    try:
+        test_strided_output()
+    except Exception as e:
+        print(f"Error: {e}")

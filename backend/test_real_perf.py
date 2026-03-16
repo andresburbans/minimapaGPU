@@ -20,7 +20,7 @@ def run_real_perf_test():
         return
 
     # Paths
-    VAL_DIR = Path("backend/gpu_validation")
+    VAL_DIR = Path("gpu_validation")
     ORTHO_PATH = VAL_DIR / "test_ortho_crop.tif"
     VECTORS = [
         (VAL_DIR / "LinderoGeneral.geojson", "red", 2),

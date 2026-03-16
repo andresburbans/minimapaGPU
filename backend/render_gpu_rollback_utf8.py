@@ -1,4 +1,4 @@
-import os
+﻿
 import math
 import logging
 import io
@@ -7,7 +7,6 @@ import random
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple, Dict, Any
 
-import uuid
 import numpy as np
 import rasterio
 from rasterio.enums import Resampling
@@ -25,44 +24,6 @@ try:
     import cupyx.scipy.ndimage as ndimage
     from cupyx.scipy.ndimage import zoom
     HAS_GPU = True
-    
-    # CRITICAL: Clean up any stale state from previous uvicorn reloads
-    try:
-        cp.cuda.Stream.null.synchronize()
-        cp.get_default_memory_pool().free_all_blocks()
-        cp.get_default_pinned_memory_pool().free_all_blocks()
-    except:
-        pass
-    
-    # P1-A Optimized: Alpha Composite Kernel (Fused Math, 0 allocations)
-    # Proper Porter-Duff Over operator: (fg * fa + bg * ba * (1 - fa)) / out_a
-    _COMPOSITE_KERNEL = cp.ElementwiseKernel(
-        'T fg_r, T fg_g, T fg_b, T fg_a, T bg_r, T bg_g, T bg_b, T bg_a',
-        'T out_r, T out_g, T out_b, T out_a',
-        '''
-        float f_a = (float)fg_a / 255.0f;
-        float b_a = (float)bg_a / 255.0f;
-        float o_a = f_a + b_a * (1.0f - f_a);
-        
-        if (o_a > 1e-6f) {
-            float f_r = (float)fg_r / 255.0f;
-            float f_g = (float)fg_g / 255.0f;
-            float f_b = (float)fg_b / 255.0f;
-            
-            float b_r = (float)bg_r / 255.0f;
-            float b_g = (float)bg_g / 255.0f;
-            float b_b = (float)bg_b / 255.0f;
-
-            out_r = (unsigned char)(((f_r * f_a + b_r * b_a * (1.0f - f_a)) / o_a) * 255.0f + 0.5f);
-            out_g = (unsigned char)(((f_g * f_a + b_g * b_a * (1.0f - f_a)) / o_a) * 255.0f + 0.5f);
-            out_b = (unsigned char)(((f_b * f_a + b_b * b_a * (1.0f - f_a)) / o_a) * 255.0f + 0.5f);
-        } else {
-            out_r = 0; out_g = 0; out_b = 0;
-        }
-        out_a = (unsigned char)(o_a * 255.0f + 0.5f);
-        ''',
-        'alpha_composite'
-    )
 except ImportError:
     HAS_GPU = False
     print("[GPU] CuPy not found, falling back to CPU logic.")
@@ -112,22 +73,33 @@ def init_gpu():
     except Exception as e:
         return {"available": False, "error": str(e)}
 
-def _alpha_composite_gpu(fg: cp.ndarray, bg: cp.ndarray, out: Optional[cp.ndarray] = None) -> cp.ndarray:
+def _alpha_composite_gpu(fg: cp.ndarray, bg: cp.ndarray) -> cp.ndarray:
     """
     Proper alpha compositing matching PIL.Image.alpha_composite using GPU.
     fg and bg are expected to be (H, W, 4) in uint8.
-    Optimized: Fused kernel with 0 extra memory allocations.
     """
-    # Create or reuse output buffer
-    if out is None:
-        out = _CONTEXT.get_composite_slice(bg.shape[0], bg.shape[1])
+    # Convert to float and normalize to 0-1
+    fg_a = fg[:, :, 3:4].astype(cp.float32) / 255.0
+    bg_a = bg[:, :, 3:4].astype(cp.float32) / 255.0
     
-    _COMPOSITE_KERNEL(
-        fg[...,0], fg[...,1], fg[...,2], fg[...,3],
-        bg[...,0], bg[...,1], bg[...,2], bg[...,3],
-        out[...,0], out[...,1], out[...,2], out[...,3]
-    )
-    return out
+    # Calculate output alpha
+    out_a = fg_a + bg_a * (1.0 - fg_a)
+    
+    # Avoid division by zero
+    out_a_safe = cp.where(out_a > 1e-6, out_a, 1.0)
+    
+    # Calculate output RGB
+    fg_rgb = fg[:, :, :3].astype(cp.float32)
+    bg_rgb = bg[:, :, :3].astype(cp.float32)
+    
+    # Formula: (fg_rgb * fg_a + bg_rgb * bg_a * (1 - fg_a)) / out_a
+    out_rgb = (fg_rgb * fg_a + bg_rgb * bg_a * (1.0 - fg_a)) / out_a_safe
+    
+    # Convert back to uint8
+    out_rgb = cp.clip(out_rgb, 0, 255).astype(cp.uint8)
+    out_a_u8 = cp.clip(out_a * 255, 0, 255).astype(cp.uint8)
+    
+    return cp.dstack((out_rgb, out_a_u8))
 
 def _gpu_downsample_box(arr: cp.ndarray, scale: int) -> cp.ndarray:
     """
@@ -211,10 +183,7 @@ def _sample_using_inverse_transform(
     offset = cp.array([off_r, off_c], dtype=cp.float32)
 
     # 4. Transform
-    # 4. Transform
-    # Reuse buffer to avoid allocation
-    result_planar = _CONTEXT._get_planar_buffer((4, out_h, out_w), dtype=cp.uint8)
-    
+    result_planar = cp.zeros((4, out_h, out_w), dtype=cp.uint8)
     for i in range(4):
         ndimage.affine_transform(
             texture_planar[i],
@@ -222,15 +191,13 @@ def _sample_using_inverse_transform(
             offset=offset,
             output_shape=(out_h, out_w),
             output=result_planar[i],
-            order=1, # Linear is faster and sufficient
+            order=1,
             mode='constant',
             cval=0,
             prefilter=False
         )
         
-    # Standard transpose (no strided trick yet to avoid breaking)
-    # This creates a copy, but we saved the input buffer allocation.
-    return cp.ascontiguousarray(cp.transpose(result_planar, (1, 2, 0)))
+    return cp.transpose(result_planar, (1, 2, 0))
 
 def _sample_wms_layer_gpu_approx(
     wms_texture_planar: cp.ndarray,
@@ -293,8 +260,7 @@ def _sample_wms_layer_gpu_approx(
     offset = cp.array([y0, x0], dtype=cp.float32)
     
     # 5. Transform
-    # 5. Transform
-    result_planar = _CONTEXT._get_planar_buffer((4, out_h, out_w), dtype=cp.uint8)
+    result_planar = cp.zeros((4, out_h, out_w), dtype=cp.uint8)
     for i in range(4):
         chan = wms_texture_planar[i] if i < wms_texture_planar.shape[0] else cp.full(wms_texture_planar.shape[1:], 255, dtype=cp.uint8)
         ndimage.affine_transform(
@@ -302,16 +268,13 @@ def _sample_wms_layer_gpu_approx(
             output=result_planar[i], order=1, mode='constant', cval=0, prefilter=False
         )
         
-    return cp.ascontiguousarray(cp.transpose(result_planar, (1, 2, 0)))
+    return cp.transpose(result_planar, (1, 2, 0))
 
 
 # --- Main Rendering Context ---
 
-import threading
-
 class GPURenderContext:
     def __init__(self):
-        self._lock = threading.Lock()
         self.ortho_texture: Optional[cp.ndarray] = None
         self.mipmaps: List[cp.ndarray] = []
         self.ortho_transform: Optional[Affine] = None
@@ -323,14 +286,6 @@ class GPURenderContext:
         self.wms_zoom = None
         self.is_ready = False
         
-        self._planar_buffer: Optional[cp.ndarray] = None
-        
-        # Identity tracking for Preview optimization
-        self.last_ortho_path = None
-        self.last_csv_path = None
-        self.last_vector_config = None
-        self.last_wms_source = None
-    
         # P1-B: Cached Transformer for WMS
         self._wms_transformer: Optional[Transformer] = None
         self._wms_from_crs_str: Optional[str] = None
@@ -345,39 +300,9 @@ class GPURenderContext:
         self._compass_size: int = 0
         self._compass_full_canvas_size: int = 0
         
-        # UI Cache
+        # P0-D: Nav UI Cache (Icon + Cone)
         self._ui_icon_cone_cache: Optional[cp.ndarray] = None  # (H, W, 4)
         self._ui_params: Dict[str, Any] = {}
-
-    def _get_planar_buffer(self, shape: Tuple[int, int, int], dtype) -> cp.ndarray:
-        """Returns a reused buffer of at least the requested shape (4, H, W)."""
-        # Shape is usually (4, H, W)
-        req_size = shape[0] * shape[1] * shape[2] * cp.dtype(dtype).itemsize
-        
-        with self._lock:
-            if (self._planar_buffer is None or 
-                self._planar_buffer.size * self._planar_buffer.itemsize < req_size):
-                # Allocate new with 20% margin to reduce re-allocations
-                self._planar_buffer = cp.zeros((shape[0], int(shape[1]*1.1), int(shape[2]*1.1)), dtype=dtype)
-            
-            # Return view of requested size
-            return self._planar_buffer[:shape[0], :shape[1], :shape[2]] 
-
-    def _ensure_work_buffers(self, width: int, height: int):
-        """Pre-allocates large compositing buffers once."""
-        with self._lock:
-            if not self._work_buffers_initialized or width > self._max_supersampled_size[0] or height > self._max_supersampled_size[1]:
-                mw = max(width, self._max_supersampled_size[0])
-                mh = max(height, self._max_supersampled_size[1])
-                self._composite_buffer = cp.zeros((mh, mw, 4), dtype=cp.uint8)
-                self._max_supersampled_size = (mw, mh)
-                self._work_buffers_initialized = True
-
-    def get_composite_slice(self, h: int, w: int) -> cp.ndarray:
-        """Returns a view of the pre-allocated composite buffer."""
-        if not self._work_buffers_initialized:
-            self._ensure_work_buffers(w, h)
-        return self._composite_buffer[:h, :w, :]
 
     def _pre_render_ui_elements_gpu(
         self, width: int, height: int, 
@@ -403,12 +328,7 @@ class GPURenderContext:
         
         _draw_center_icon(ui_img, center_px, arrow_size_px, icon_circle_opacity, icon_circle_size_px, 0.0)
         
-        # Safe upload
-        ui_np = np.ascontiguousarray(np.array(ui_img))
-        self._ui_icon_cone_cache = cp.empty(ui_np.shape, dtype=ui_np.dtype)
-        self._ui_icon_cone_cache.set(ui_np)
-        cp.cuda.Stream.null.synchronize()
-        
+        self._ui_icon_cone_cache = cp.asarray(np.array(ui_img))
         self._ui_params = params
 
     def _pre_render_compass_cache(self, compass_size: int):
@@ -429,14 +349,10 @@ class GPURenderContext:
             _draw_compass(img, center, compass_size, -float(h))
             cache_cpu[h] = np.array(img)
             
-        # Safe upload
-        self._compass_cache = cp.empty(cache_cpu.shape, dtype=cache_cpu.dtype)
-        self._compass_cache.set(cache_cpu)
-        cp.cuda.Stream.null.synchronize()
-        
+        self._compass_cache = cp.asarray(cache_cpu)
         self._compass_size = compass_size
         self._compass_full_canvas_size = canvas_sz
-        print(f"[GPU] Cache de brújula generado: 360 rotaciones, tamaño {canvas_sz}x{canvas_sz}")
+        print(f"[GPU] Cache de br├║jula generado: 360 rotaciones, tama├▒o {canvas_sz}x{canvas_sz}")
 
     def get_compass_for_heading(self, heading: float) -> cp.ndarray:
         """Returns the pre-rendered compass textures for the given heading."""
@@ -478,51 +394,6 @@ class GPURenderContext:
         return self._composite_buffer[:h, :w, :]
 
     def clear(self):
-        """Limpia todo el contexto para liberar VRAM de forma segura."""
-        with self._lock:
-            self.ortho_texture = None
-            self.mipmaps = []
-            self.vector_texture = None
-            self.wms_texture = None
-            self._wms_transformer = None
-            self._wms_from_crs_str = None
-            self._composite_buffer = None
-            self._work_buffers_initialized = False
-            self._planar_buffer = None
-            self._compass_cache = None
-            self._ui_icon_cone_cache = None
-            self._ui_params = {}
-            self.is_ready = False
-            
-            if HAS_GPU:
-                try:
-                    cp.cuda.Stream.null.synchronize()
-                    # Explicitly unregister any host memory if CuPy did it automatically
-                    # Note: We don't have a list to iterate, but clear pools helps
-                    import gc
-                    gc.collect()
-                    cp.get_default_memory_pool().free_all_blocks()
-                    cp.get_default_pinned_memory_pool().free_all_blocks()
-                except Exception as e:
-                    print(f"[GPU] Error al liberar memoria: {e}")
-
-    def preload(self, dataset, center_points, margin_m, vectors=None, 
-                arrow_size=100, cone_len=200, wms_source="google_hybrid", 
-                icon_opacity=0.4, progress_callback=None):
-        """
-        Main pre-loading logic following the sequential steps in documentation.
-        """
-        preload_id = uuid.uuid4().hex[:4]
-        
-        with self._lock:
-            # Clear any existing state to start fresh
-            self._clear_internal()
-            return self._preload_impl(dataset, center_points, margin_m, vectors, 
-                                    arrow_size, cone_len, wms_source, 
-                                    icon_opacity, progress_callback, preload_id)
-
-    def _clear_internal(self):
-        """Limpia todo el contexto para liberar VRAM de forma segura (sin lock)."""
         self.ortho_texture = None
         self.mipmaps = []
         self.vector_texture = None
@@ -531,39 +402,28 @@ class GPURenderContext:
         self._wms_from_crs_str = None
         self._composite_buffer = None
         self._work_buffers_initialized = False
-        self._planar_buffer = None
         self._compass_cache = None
         self._ui_icon_cone_cache = None
         self._ui_params = {}
         self.is_ready = False
-        
+        import gc
+        gc.collect()
         if HAS_GPU:
             try:
-                cp.cuda.Stream.null.synchronize()
-                import gc
-                gc.collect()
                 cp.get_default_memory_pool().free_all_blocks()
                 cp.get_default_pinned_memory_pool().free_all_blocks()
-            except Exception as e:
-                print(f"[GPU] Error al liberar memoria: {e}")
+            except: pass
 
-    def _preload_impl(self, dataset, center_points, margin_m, vectors=None, 
-                    arrow_size=100, cone_len=200, wms_source="google_hybrid", 
-                    icon_opacity=0.4, progress_callback=None, preload_id="init"):
+    def preload(self, dataset, center_points, margin_m, vectors=None, 
+                arrow_size=100, cone_len=200, wms_source="google_hybrid", 
+                icon_opacity=0.4, progress_callback=None):
         
-        pid = os.getpid()
-        
-        # Ensure GPU is idle before preloading
-        if HAS_GPU:
-             cp.cuda.Stream.null.synchronize()
-
         def notify(pct, msg):
             if progress_callback: progress_callback(pct, msg)
-            print(f"[GPU][preload][id={preload_id}][pct={pct}] {msg}")
+            print(f"[GPU] {pct}% - {msg}")
             
         if not HAS_GPU: return False
         
-        # ... bounds calculation ...
         es = [p[0] for p in center_points]
         ns = [p[1] for p in center_points]
         xmin, xmax = min(es) - margin_m, max(es) + margin_m
@@ -587,20 +447,7 @@ class GPURenderContext:
         self.ortho_transform = rasterio.windows.transform(window, dataset.transform) * Affine.scale(window.width/tw, window.height/th)
         self.ortho_crs = dataset.crs
         self.ortho_res_m = dataset.res[0] * (window.width/tw)
-        
-        # Safe upload using explicit .set()
-        try:
-            print(f"[GPU-DEBUG][id={preload_id}][phase=ortho] Uploading to GPU...")
-            cp.cuda.Stream.null.synchronize()
-            t_ortho = cp.empty(normalized.shape, dtype=normalized.dtype)
-            t_ortho.set(normalized)
-            self.ortho_texture = cp.ascontiguousarray(t_ortho.transpose(2, 0, 1))
-            cp.cuda.Stream.null.synchronize()
-            del t_ortho
-            print(f"[GPU-DEBUG][id={preload_id}][phase=ortho] Upload complete.")
-        except Exception as ue:
-            print(f"[GPU-ERR][id={preload_id}] Error al subir Ortofoto: {ue}")
-            raise ue
+        self.ortho_texture = cp.ascontiguousarray(cp.asarray(normalized).transpose(2, 0, 1))
         
         notify(40, "Generando Mipmaps GPU...")
         self.mipmaps = [self.ortho_texture]
@@ -609,7 +456,7 @@ class GPURenderContext:
         if tw > 4 and th > 4:
             self.mipmaps.append(cp.ascontiguousarray(self.mipmaps[-1][:, ::2, ::2]))
             
-        notify(60, "Procesando Vectores (Ventana Crítica)...")
+        notify(60, "Procesando Vectores...")
         vec_img = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
         draw = ImageDraw.Draw(vec_img)
         itf = ~self.ortho_transform
@@ -621,56 +468,23 @@ class GPURenderContext:
                 for g in geoms:
                     _draw_geometry_precise(draw, g, map_func, color, eff_width, pattern)
         
-        try:
-            print(f"[GPU-DEBUG][id={preload_id}][phase=vectors] Syncing and clearing pool...")
-            cp.cuda.Stream.null.synchronize()
-            cp.get_default_pinned_memory_pool().free_all_blocks()
-            
-            vec_np = np.ascontiguousarray(np.array(vec_img))
-            print(f"[GPU-DEBUG][id={preload_id}][phase=vectors] Memory: {vec_np.nbytes/1024/1024:.2f}MB")
-            
-            t_vec = cp.empty(vec_np.shape, dtype=vec_np.dtype)
-            t_vec.set(vec_np)
-            self.vector_texture = cp.ascontiguousarray(t_vec.transpose(2, 0, 1))
-            
-            cp.cuda.Stream.null.synchronize()
-            del t_vec, vec_np
-            print(f"[GPU-DEBUG][id={preload_id}][phase=vectors] Upload complete.")
-        except Exception as ve:
-            print(f"[GPU-ERR][id={preload_id}] !!! VECTORS UPLOAD FAILED: {ve}")
-            raise ve
+        self.vector_texture = cp.ascontiguousarray(cp.asarray(np.array(vec_img)).transpose(2, 0, 1))
         
-        notify(75, "Descargando WMS (Ventana Crítica)...")
+        notify(75, "Descargando WMS...")
         w_geo, s_geo, e_geo, n_geo = transform_bounds(dataset.crs, "EPSG:4326", xmin, ymin, xmax, ymax)
         span_deg = max(e_geo - w_geo, n_geo - s_geo)
+        # Use same logic as CPU for zoom
         TARGET_PX = 2048
         wms_zoom = min(19, max(1, int(math.log2((TARGET_PX * 360) / (256 * span_deg)) + 0.5)))
         
-        print(f"[GPU-DEBUG][id={preload_id}][phase=wms] Fetching zoom={wms_zoom}...")
         ret_wms = _fetch_wms_mosaic_for_bounds(w_geo, s_geo, e_geo, n_geo, wms_zoom, source=wms_source)
         if ret_wms[0]:
-            try:
-                print(f"[GPU-DEBUG][id={preload_id}][phase=wms] Converting to array...")
-                wms_rgba = np.ascontiguousarray(np.array(ret_wms[0].convert("RGBA")))
-                
-                print(f"[GPU-DEBUG][id={preload_id}][phase=wms] Syncing and clearing pool...")
-                cp.cuda.Stream.null.synchronize()
-                cp.get_default_pinned_memory_pool().free_all_blocks()
-                
-                t_wms = cp.empty(wms_rgba.shape, dtype=wms_rgba.dtype)
-                t_wms.set(wms_rgba)
-                self.wms_texture = cp.ascontiguousarray(t_wms.transpose(2, 0, 1))
-                self.wms_bounds_px = ret_wms[1]
-                self.wms_zoom = wms_zoom
-                
-                cp.cuda.Stream.null.synchronize()
-                del t_wms, wms_rgba
-                print(f"[GPU-DEBUG][id={preload_id}][phase=wms] Upload complete.")
-            except Exception as we:
-                print(f"[GPU-ERR][id={preload_id}] !!! WMS UPLOAD FAILED: {we}")
-                raise we
+            wms_rgba = np.array(ret_wms[0].convert("RGBA"))
+            self.wms_texture = cp.ascontiguousarray(cp.asarray(wms_rgba).transpose(2, 0, 1))
+            self.wms_bounds_px = ret_wms[1]
+            self.wms_zoom = wms_zoom
             
-        notify(95, "Pre-renderizando Brújula...")
+        notify(95, "Pre-renderizando Br├║jula...")
         self._pre_render_compass_cache(40) # Default size, will re-cache if app requests different size
         
         notify(100, "Precarga GPU completada.")
@@ -749,11 +563,7 @@ def render_frame_gpu(
         final_gpu = _alpha_composite_gpu(_CONTEXT._ui_icon_cone_cache, final_gpu)
 
     if show_compass:
-        if _CONTEXT._compass_cache is None or _CONTEXT._compass_size != compass_size_px:
-             # Cache miss or resize: generate immediately
-             _CONTEXT._pre_render_compass_cache(compass_size_px)
-             
-        if _CONTEXT._compass_cache is not None:
+        if _CONTEXT._compass_cache is not None and _CONTEXT._compass_size == compass_size_px:
             # P0-C: Use GPU Cache
             compass_gpu = _CONTEXT.get_compass_for_heading(heading)
             c_full_sz = _CONTEXT._compass_full_canvas_size
@@ -771,26 +581,12 @@ def render_frame_gpu(
             # Boundary check
             if x0 >= 0 and y0 >= 0 and x0 + c_full_sz <= width and y0 + c_full_sz <= height:
                 region = final_gpu[y0 : y0 + c_full_sz, x0 : x0 + c_full_sz, :]
-                _alpha_composite_gpu(compass_gpu, region, out=region)
-        
-        # P1-C: Ensure all GPU commands are scheduled before returning
-        # cp.cuda.Stream.null.synchronize() 
+                final_gpu[y0 : y0 + c_full_sz, x0 : x0 + c_full_sz, :] = _alpha_composite_gpu(compass_gpu, region)
     
     return final_gpu
 
 def preload_track_gpu(config: Any, jobs: List[Tuple], progress_callback=None) -> None:
     if not HAS_GPU: return
-    
-    # CRITICAL: Deep clean before any preload to avoid stale mappings
-    try:
-        cp.cuda.Stream.null.synchronize()
-        cp.get_default_memory_pool().free_all_blocks()
-        cp.get_default_pinned_memory_pool().free_all_blocks()
-        import gc
-        gc.collect()
-    except Exception as e:
-        print(f"[GPU] Warning during pre-clean: {e}")
-    
     centers = [(j[1], j[2]) for j in jobs]
     with rasterio.open(config.ortho_path) as dataset:
         vectors = load_vectors(
@@ -804,11 +600,6 @@ def preload_track_gpu(config: Any, jobs: List[Tuple], progress_callback=None) ->
             arrow_size=config.arrow_size_px, cone_len=config.cone_length_px, wms_source=config.wms_source,
             icon_opacity=getattr(config, 'icon_circle_opacity', 0.4), progress_callback=progress_callback
         )
-        # Store identity for preview optimization
-        _CONTEXT.last_ortho_path = os.path.normpath(config.ortho_path)
-        _CONTEXT.last_csv_path = os.path.normpath(config.csv_path)
-        _CONTEXT.last_vector_config = str(config.vector_layers) + str(config.vectors_paths)
-        _CONTEXT.last_wms_source = config.wms_source
 
 def cleanup_gpu():
     if _CONTEXT: _CONTEXT.clear()

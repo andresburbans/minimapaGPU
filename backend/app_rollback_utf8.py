@@ -1,4 +1,4 @@
-import io
+﻿import io
 import math
 import urllib.request
 import functools
@@ -34,7 +34,6 @@ try:
         init_gpu,
         preload_track_gpu,
         cleanup_gpu,
-        _CONTEXT,
     )
     GPU_RENDER_AVAILABLE = True
 except ImportError:
@@ -227,45 +226,38 @@ async def preview(req: PreviewRequest):
     segments = load_segments(cfg.csv_path)
     center_e, center_n, heading = interpolate_position(segments, req.time_sec)
 
-    try:
-        with rasterio.open(cfg.ortho_path) as dataset:
-            # Force CPU for Preview to avoid Preload overhead and locking
-            # This is the behavior from the stable rollback checkpoint
-            cfg.use_gpu = False
+    with rasterio.open(cfg.ortho_path) as dataset:
+        vectors = load_vectors(
+            dataset.crs,
+            [layer.model_dump() for layer in cfg.vector_layers],
+            cfg.vectors_paths,
+            cfg.curves_path,
+            cfg.line_color,
+            cfg.line_width,
+            cfg.boundary_color,
+            cfg.boundary_width,
+            cfg.point_color,
+        )
+        # Use a safe overscan for clipping vectors to avoid truncation during rotation
+        # A factor of 2.0 covers the diagonal and rotation safely
+        clip_margin = cfg.map_half_width_m * 2.0
+        bbox = (
+            center_e - clip_margin,
+            center_n - clip_margin,
+            center_e + clip_margin,
+            center_n + clip_margin,
+        )
+        vectors = clip_vectors(vectors, bbox)
+        
+        # Force CPU for Preview to avoid Preload overhead and locking
+        cfg.use_gpu = False
+        
+        # Dispatch rendering (handles GPU/CPU switch and fallback)
+        frame = _dispatch_render(cfg, dataset, vectors, center_e, center_n, heading)
             
-            vectors = load_vectors(
-                dataset.crs,
-                [layer.model_dump() for layer in cfg.vector_layers],
-                cfg.vectors_paths,
-                cfg.curves_path,
-                cfg.line_color,
-                cfg.line_width,
-                cfg.boundary_color,
-                cfg.boundary_width,
-                cfg.point_color,
-            )
-            clip_margin = cfg.map_half_width_m * 2.0
-            bbox = (
-                center_e - clip_margin,
-                center_n - clip_margin,
-                center_e + clip_margin,
-                center_n + clip_margin,
-            )
-            vectors = clip_vectors(vectors, bbox)
-            
-            frame = _dispatch_render(cfg, dataset, vectors, center_e, center_n, heading)
-                
-            buf = io.BytesIO()
-            frame.save(buf, format="PNG")
-            return Response(content=buf.getvalue(), media_type="image/png")
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return Response(content=f"Error: {e}".encode(), status_code=500)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return Response(content=f"Error: {e}".encode(), status_code=500)
+        buf = io.BytesIO()
+        frame.save(buf, format="PNG")
+        return Response(content=buf.getvalue(), media_type="image/png")
 
 
 @app.post("/render")
@@ -340,13 +332,13 @@ async def file(path: str):
 
 @app.get("/gpu-info")
 async def gpu_info():
-    """Endpoint para obtener información de la GPU disponible"""
+    """Endpoint para obtener informaci├│n de la GPU disponible"""
     return gpu_utils.detect_cuda_gpu()
 
 
 @app.get("/stats")
 def stats():
-    """Endpoint de telemetría en tiempo real"""
+    """Endpoint de telemetr├¡a en tiempo real"""
     return gpu_utils.get_system_stats()
 
 
@@ -369,7 +361,7 @@ async def ortho_info(path: str):
             bounds = dataset.bounds
             
             # EXPANSION TRICK:
-            # Expandimos 2.0x los bounds reportados para que el frontend cree un canvas más grande
+            # Expandimos 2.0x los bounds reportados para que el frontend cree un canvas m├ís grande
             center_x = (bounds.left + bounds.right) / 2
             center_y = (bounds.bottom + bounds.top) / 2
             half_w = (bounds.right - bounds.left) / 2
@@ -400,18 +392,18 @@ async def ortho_info(path: str):
 
 @app.get("/ortho-preview")
 async def ortho_preview(path: str, max_size: int = 1500):
-    """Generar una imagen de preview del ortomosaico para navegación"""
+    """Generar una imagen de preview del ortomosaico para navegaci├│n"""
     from PIL import Image
     import numpy as np
     
     try:
         with rasterio.open(path) as dataset:
-            # Calcular factor de reducción ideal
+            # Calcular factor de reducci├│n ideal
             scale = min(max_size / dataset.width, max_size / dataset.height, 1.0)
             out_width = max(int(dataset.width * scale), 1)
             out_height = max(int(dataset.height * scale), 1)
             
-            # Leer usando overviews si están disponibles (automático en rasterio.read con out_shape)
+            # Leer usando overviews si est├ín disponibles (autom├ítico en rasterio.read con out_shape)
             data = dataset.read(
                 out_shape=(dataset.count, out_height, out_width),
                 resampling=Resampling.bilinear,
@@ -448,7 +440,7 @@ async def ortho_preview(path: str, max_size: int = 1500):
                      img_data = np.dstack((rgb, mask))
                      mode = "RGBA"
             
-            # Normalización robusta solo en canales de color
+            # Normalizaci├│n robusta solo en canales de color
             color_channels = 3 if mode == "RGBA" or mode == "RGB" else 1 # Simplifying
             
             # If not uint8, normalize
@@ -471,15 +463,15 @@ async def ortho_preview(path: str, max_size: int = 1500):
                 else:
                     img_data = colors
             
-            # 4. Crear lienzo transparente de tamaño expandido
+            # 4. Crear lienzo transparente de tama├▒o expandido
             EXP_FACTOR = 2.0
             
             # Dimensiones deseadas finales (thumbnail)
             # El ortho original escalado a 'out_width/out_height' cabe en max_size
-            # Pero queremos devolver una imagen de tamaño max_size que contenga padding.
+            # Pero queremos devolver una imagen de tama├▒o max_size que contenga padding.
             
-            # Recalculamos: max_size será el tamaño del bounding box expandido.
-            # El ortho real será size / EXP_FACTOR
+            # Recalculamos: max_size ser├í el tama├▒o del bounding box expandido.
+            # El ortho real ser├í size / EXP_FACTOR
             
             real_w_thumb = int(out_width)
             real_h_thumb = int(out_height)
@@ -645,7 +637,7 @@ async def ortho_wms_preview(path: Optional[str] = None, max_size: int = 1500, zo
                         densify_pts=21,
                     )
                     # EXPANSION WMS:
-                    # Expandir el bounding box geográfico al mismo factor que ortho_info
+                    # Expandir el bounding box geogr├ífico al mismo factor que ortho_info
                     cx = (west + east) / 2
                     cy = (south + north) / 2
                     hw = (east - west) / 2
@@ -695,7 +687,7 @@ async def default_metadata():
         "transform": [1000, 0, -8794239, 0, -1000, 1459456], # Dummy transform
         "crs": "EPSG:3857",
         "res": [1000, 1000],
-        # También enviamos los bounds lat/lon para llamar al WMS
+        # Tambi├®n enviamos los bounds lat/lon para llamar al WMS
         "wms_bounds": "-79,-4,-67,13"
     }
 
@@ -768,7 +760,7 @@ async def cancel_job(job_id: str):
         job = _JOBS.get(job_id)
         if job and job["status"] in ["queued", "rendering", "encoding", "tracking", "optimizing"]:
             job["cancel_requested"] = True
-            job["log"].append("🛑 Solicitud de cancelación recibida...")
+            job["log"].append("­ƒøæ Solicitud de cancelaci├│n recibida...")
             return {"success": True}
     return {"success": False, "message": "Job not found or not active"}
 
@@ -857,15 +849,13 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                 try:
                     from render_gpu import preload_track_gpu
                     _update_job(job_id, log="Iniciando precarga en GPU...")
-                    # Deep clean first
-                    cleanup_gpu()
                     def preload_cb(pct, msg):
                         # Force log update
                         _update_job(job_id, log=f"Precarga {pct}%: {msg}")
                     
                     preload_track_gpu(config, jobs, progress_callback=preload_cb) 
                 except Exception as e:
-                    err_msg = f"[GPU] Error crítico en precarga: {e}. El proceso se detiene por seguridad."
+                    err_msg = f"[GPU] Error cr├¡tico en precarga: {e}. El proceso se detiene por seguridad."
                     _update_job(job_id, status="failed", message=err_msg, log=err_msg)
                     raise RuntimeError(err_msg)
             
@@ -882,7 +872,7 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
             nvenc = _nvenc_available()
             codec = "h264_nvenc" if nvenc else "libx264"
             preset = "p5" if nvenc else "fast"
-            if nvenc: _update_job(job_id, log="Usando Aceleración de Hardware NVENC")
+            if nvenc: _update_job(job_id, log="Usando Aceleraci├│n de Hardware NVENC")
             try:
                 cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{config.width}x{config.height}", "-pix_fmt", "rgba", "-r", str(config.fps), "-i", "-", "-c:v", codec, "-preset", preset, "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_path)]
                 ffmpeg_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=20*1024*1024)
@@ -892,29 +882,20 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
         
         # Prepare Pinned Memory for Zero-Copy Transfer
         pinned_cpu_buffer = None
-        pinned_mem = None
         if use_pipe and GPU_RENDER_AVAILABLE:
             try:
                 import cupy as cp
                 import numpy as np
                 # Allocate Pinned Memory (Page-locked)
+                # Size: Width x Height x 4 (RGBA)
                 alloc_size = config.width * config.height * 4
-                try:
-                    pinned_mem = cp.cuda.alloc_pinned_memory(alloc_size)
-                except Exception as e:
-                    if "cudaErrorAlreadyMapped" in str(e) or "cudaErrorMemoryAllocation" in str(e):
-                        _update_job(job_id, log="Limpiando pools de memoria para asignar Pinned Mem...")
-                        cp.get_default_pinned_memory_pool().free_all_blocks()
-                        pinned_mem = cp.cuda.alloc_pinned_memory(alloc_size)
-                    else: raise e
-                
+                pinned_mem = cp.cuda.alloc_pinned_memory(alloc_size)
                 # Create Numpy array backed by pinned memory (Slice to exact size)
                 pinned_cpu_buffer = np.frombuffer(pinned_mem, np.uint8)[:alloc_size].reshape((config.height, config.width, 4))
                 _update_job(job_id, log="Memoria 'Pinned' activada.")
             except Exception as e:
                 _update_job(job_id, log=f"No Pinned Mem: {e}")
                 pinned_cpu_buffer = None
-                pinned_mem = None
 
         # Frame cache to avoid re-rendering identical frames
         frame_cache = {}
@@ -939,7 +920,7 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                     # Check Cancellation
                     with _JOB_LOCK:
                         if _JOBS.get(job_id, {}).get("cancel_requested"):
-                            _update_job(job_id, status="cancelled", message="Cancelado por usuario", log="🛑 Cancelado.")
+                            _update_job(job_id, status="cancelled", message="Cancelado por usuario", log="­ƒøæ Cancelado.")
                             raise InterruptedError("Cancelled")
 
                     # Create cache key
@@ -969,18 +950,23 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                              except: pass
 
                         # Handle Output (Pinned mem or Standard)
-                        to_write = None
+                        bytes_to_write = None
                         if use_pipe and pinned_cpu_buffer is not None and hasattr(frame, 'get'):
                             frame.get(out=pinned_cpu_buffer)
-                            # Direct write from buffer (No Copy)
-                            to_write = pinned_cpu_buffer
+                            # Draw Compass on CPU Pinned Buffer (In-Place)
+                            if config.show_compass:
+                                 pim = Image.frombuffer("RGBA", (config.width, config.height), pinned_cpu_buffer, "raw", "RGBA", 0, 1)
+                                 c_pos = (config.width - config.compass_size_px - 10, config.compass_size_px + 10)
+                                 from render import _draw_compass
+                                 _draw_compass(pim, c_pos, config.compass_size_px, -heading)
+                            bytes_to_write = pinned_cpu_buffer.tobytes()
                         elif use_pipe:
-                             if hasattr(frame, 'tobytes'): to_write = frame.tobytes()
-                             elif hasattr(frame, 'get'): to_write = frame.get().tobytes()
+                             if hasattr(frame, 'tobytes'): bytes_to_write = frame.tobytes()
+                             elif hasattr(frame, 'get'): bytes_to_write = frame.get().tobytes()
 
-                        if use_pipe and ffmpeg_proc and to_write is not None:
+                        if use_pipe and ffmpeg_proc and bytes_to_write:
                             try:
-                                ffmpeg_proc.stdin.write(to_write)
+                                ffmpeg_proc.stdin.write(bytes_to_write)
                             except Exception as e:
                                 raise RuntimeError(f"FFmpeg Pipe Error: {e}")
                         else:
@@ -1004,7 +990,7 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                         remaining = total_frames - frames_done
                         eta_str = _format_eta(remaining / fps_rate if fps_rate > 0 else 0)
                         pct = int((frames_done / total_frames) * 100)
-                        msg = f"{pct}% • Frame {frames_done}/{total_frames} • {fps_rate:.1f} FPS • ETA {eta_str}"
+                        msg = f"{pct}% ÔÇó Frame {frames_done}/{total_frames} ÔÇó {fps_rate:.1f} FPS ÔÇó ETA {eta_str}"
                     else:
                         msg = f"Iniciando... Frame {frames_done}/{total_frames}"
                     _update_job(job_id, progress=frames_done, message=msg)
@@ -1049,7 +1035,7 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                     with _JOB_LOCK:
                          if _JOBS.get(job_id, {}).get("cancel_requested"):
                              pool.terminate()
-                             _update_job(job_id, status="cancelled", message="Cancelado por usuario", log="🛑 Cancelado.")
+                             _update_job(job_id, status="cancelled", message="Cancelado por usuario", log="­ƒøæ Cancelado.")
                              raise InterruptedError("Cancelled")
 
                     done += 1
@@ -1058,7 +1044,7 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                         fps_rate = done / elapsed
                         remaining = total - done
                         eta_str = _format_eta(remaining / fps_rate if fps_rate > 0 else 0)
-                        msg = f"Frame {done}/{total} • ETA: {eta_str}"
+                        msg = f"Frame {done}/{total} ÔÇó ETA: {eta_str}"
                     else:
                         msg = f"Frame {done}/{total}"
                     _update_job(job_id, progress=done, message=msg)
@@ -1084,21 +1070,9 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
     except Exception as exc:
         _update_job(job_id, status="error", message="Error en render", log=str(exc), error=str(exc))
     finally:
-        # Cleanup Pinned Memory References
-        pinned_cpu_buffer = None
-        pinned_mem = None
-        # Ensure FFmpeg is closed
-        if use_pipe and ffmpeg_proc:
-            try:
-                if ffmpeg_proc.stdin: ffmpeg_proc.stdin.close()
-                ffmpeg_proc.wait(timeout=5)
-            except: 
-                try: ffmpeg_proc.kill()
-                except: pass
         if GPU_RENDER_AVAILABLE:
+            # Liberar memoria GPU al terminar (├®xito o error)
             cleanup_gpu()
-        import gc
-        gc.collect()
 
 
 def _track_task(job_id: str, req: TrackRequest, output_path: Path) -> None:

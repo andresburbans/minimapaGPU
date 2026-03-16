@@ -55,24 +55,17 @@ def setup_dummy_context():
     render_gpu._CONTEXT.is_ready = True
     print("[TEST] Context Ready.")
 
-def run_test():
+def run_resolution_test(width, height, label):
     # FHD Output
-    W, H = 1920, 1080
+    W, H = width, height
     FPS = 30
     DURATION_SEC = 2 # Short run
     TOTAL_FRAMES = FPS * DURATION_SEC
     
-    OUTPUT_FILE = r"backend/gpu_validation/pipe_test.mp4"
+    OUTPUT_FILE = f"backend/gpu_validation/pipe_test_{label}.mp4"
     if not os.path.exists("backend/gpu_validation"):
         os.makedirs("backend/gpu_validation")
         
-    # Setup Context
-    try:
-        setup_dummy_context()
-    except Exception as e:
-        print(f"[TEST] Failed to setup context: {e}")
-        return
-
     # Mock Data (Movement across dummy map)
     # Center of map is w/2 * res = 4096 * 0.1 = 409
     cx, cy = 400.0, 400.0
@@ -83,7 +76,7 @@ def run_test():
         pinned_mem = cp.cuda.alloc_pinned_memory(alloc_size)
         pinned_buffer = np.frombuffer(pinned_mem, np.uint8)[:alloc_size].reshape((H, W, 4))
     except Exception as e:
-        print(f"[TEST] Pinned Memory Failed: {e}")
+        print(f"[TEST] Pinned Memory Failed for {label}: {e}")
         return
 
     # FFmpeg Command
@@ -97,23 +90,23 @@ def run_test():
         OUTPUT_FILE, '-loglevel', 'error'
     ]
 
-    print(f"[TEST] Starting 3 Cycles (FHD 1080p) WITH HEAVY RENDER...")
+    print(f"\n[TEST] Testing {label} ({W}x{H}) - {TOTAL_FRAMES} frames...")
 
-    for cycle in range(1, 4):
-        print(f"\n--- CYCLE {cycle} ---")
+    # Run 1 cycle for resolution test to save time, or multiple if needed
+    cycles = 2
+    for cycle in range(1, cycles + 1):
+        print(f"--- CYCLE {cycle}/{cycles} ---")
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         t0 = time.time()
         
         try:
             for i in range(TOTAL_FRAMES):
-                # Render (Valid Context)
-                # render_frame_gpu args: dataset, vectors, e, n, heading...
-                # We pass None for dataset as context is ready.
-                
                 # Move center
                 ce = cx + i * 0.5
                 cn = cy + i * 0.5
                 
+                # Render
+                # Note: render_frame_gpu assumes context is ready and dataset can be None
                 gpu_frame = render_gpu.render_frame_gpu(
                     None, [], ce, cn, 45.0 + i, W, H, 100.0, 50, 60.0, 200, 0.3, 0.5, 20,
                     show_compass=True, compass_size_px=40
@@ -127,18 +120,42 @@ def run_test():
                      proc.stdin.write(gpu_frame.tobytes())
                 
                 if i % 10 == 0:
-                    print(f"Cycle {cycle}: {i}/{TOTAL_FRAMES}", end='\r')
+                    print(f"  Frame {i}/{TOTAL_FRAMES}", end='\r')
 
             proc.stdin.close()
             proc.wait()
             total_t = time.time() - t0
-            print(f"Cycle {cycle}: {TOTAL_FRAMES} frames in {total_t:.2f}s => {TOTAL_FRAMES/total_t:.2f} FPS")
+            print(f"  Cycle {cycle}: {TOTAL_FRAMES} frames in {total_t:.2f}s => {TOTAL_FRAMES/total_t:.2f} FPS")
             
         except Exception as e:
             print(f"[TEST] Error: {e}")
             import traceback
             traceback.print_exc()
             proc.kill()
+            
+    # Cleanup pinned memory explicitly if possible, though Python GC usually handles it
+    del pinned_buffer
+    del pinned_mem
+
+def main():
+    # Setup Context once
+    try:
+        setup_dummy_context()
+    except Exception as e:
+        print(f"[TEST] Failed to setup context: {e}")
+        return
+
+    # Run tests
+    print("\n" + "="*50)
+    print("STARTING RESOLUTION TESTS")
+    print("="*50)
+    
+    run_resolution_test(1920, 1080, "FHD")
+    run_resolution_test(3840, 2160, "4K")
+    
+    print("\n" + "="*50)
+    print("TESTS COMPLETED")
+    print("="*50)
 
 if __name__ == "__main__":
-    run_test()
+    main()
