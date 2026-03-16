@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Literal
 
 
 class VectorLayer(BaseModel):
@@ -62,6 +62,7 @@ class RenderConfig(BaseModel):
     point_color: str = "#ff9f1c"
     background_opacity: float = 1.0
     use_gpu: bool = False
+    engine: Literal["v1", "v2"] = "v1"
     workers: int = 0
     wms_source: str = "google_hybrid"
     output_name: str = "minimapa.mp4"

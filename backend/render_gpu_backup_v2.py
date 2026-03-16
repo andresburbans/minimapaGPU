@@ -416,9 +416,21 @@ class GPURenderContext:
         gc.collect()
         if HAS_GPU:
             try:
+                cp.cuda.Stream.null.synchronize()
+            except Exception:
+                pass
+            try:
+                cp.cuda.runtime.deviceSynchronize()
+            except Exception:
+                pass
+            try:
                 cp.get_default_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+            try:
                 cp.get_default_pinned_memory_pool().free_all_blocks()
-            except: pass
+            except Exception:
+                pass
 
     def preload(self, dataset, center_points, margin_m, vectors=None, 
                 arrow_size=100, cone_len=200, wms_source="google_hybrid", 

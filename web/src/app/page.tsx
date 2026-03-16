@@ -46,6 +46,7 @@ type RenderConfig = {
   point_color: string;
   output_name: string;
   use_gpu: boolean;
+  engine: "v1" | "v2";
   workers: number;
   wms_source: string;
 };
@@ -399,6 +400,7 @@ export default function Home() {
   const [compassSize, setCompassSize] = useState(40);
   const [outputName, setOutputName] = useState("minimapa.mp4");
   const [useGpu, setUseGpu] = useState(false);
+  const [renderEngine, setRenderEngine] = useState<"v1" | "v2">("v1");
   const [wmsSource, setWmsSource] = useState("google_hybrid");
 
   // ========== PATH MODE STATE ==========
@@ -1290,7 +1292,7 @@ export default function Home() {
           icon_circle_size_px: iconCircleSize,
           show_compass: showCompass,
           compass_size_px: compassSize,
-          line_color: DEFAULT_LINE_COLOR, line_width: DEFAULT_LINE_WIDTH, boundary_color: DEFAULT_BOUNDARY_COLOR, boundary_width: DEFAULT_BOUNDARY_WIDTH, point_color: DEFAULT_POINT_COLOR, output_name: safeOutputName, use_gpu: useGpu, workers: 0,
+          line_color: DEFAULT_LINE_COLOR, line_width: DEFAULT_LINE_WIDTH, boundary_color: DEFAULT_BOUNDARY_COLOR, boundary_width: DEFAULT_BOUNDARY_WIDTH, point_color: DEFAULT_POINT_COLOR, output_name: safeOutputName, use_gpu: useGpu, engine: renderEngine, workers: 0,
           wms_source: wmsSource
         };
 
@@ -1365,7 +1367,7 @@ export default function Home() {
         icon_circle_size_px: iconCircleSize,
         show_compass: showCompass,
         compass_size_px: compassSize,
-        line_color: DEFAULT_LINE_COLOR, line_width: DEFAULT_LINE_WIDTH, boundary_color: DEFAULT_BOUNDARY_COLOR, boundary_width: DEFAULT_BOUNDARY_WIDTH, point_color: DEFAULT_POINT_COLOR, output_name: safeOutputName, use_gpu: useGpu, workers: 0,
+        line_color: DEFAULT_LINE_COLOR, line_width: DEFAULT_LINE_WIDTH, boundary_color: DEFAULT_BOUNDARY_COLOR, boundary_width: DEFAULT_BOUNDARY_WIDTH, point_color: DEFAULT_POINT_COLOR, output_name: safeOutputName, use_gpu: useGpu, engine: renderEngine, workers: 0,
         wms_source: wmsSource
       };
 
@@ -1386,7 +1388,7 @@ export default function Home() {
       settings: {
         fps, width, height, mapHalfWidth, mapZoomFactor, arrowSize, iconCircleSize,
         coneAngle, coneLength, coneOpacity, iconCircleOpacity, showCompass, compassSize,
-        outputName, wmsSource, useGpu
+        outputName, wmsSource, useGpu, renderEngine
       },
       ortho: {
         ref: orthoRef,
@@ -1445,6 +1447,7 @@ export default function Home() {
           setOutputName(project.settings.outputName ?? "minimapa.mp4");
           setWmsSource(project.settings.wmsSource || "google_hybrid");
           setUseGpu(project.settings.useGpu ?? false);
+          setRenderEngine(project.settings.renderEngine === "v2" ? "v2" : "v1");
         }
 
         if (project.ortho) {
@@ -2236,6 +2239,23 @@ export default function Home() {
                   <label className="flex flex-col">Nombre archivo
                     <input type="text" value={outputName} onChange={(e) => setOutputName(e.target.value)} className="rounded border p-1" />
                   </label>
+                  <div className="rounded-xl border border-[var(--line)] bg-white/60 p-3">
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-[var(--muted)]">Engine</div>
+                    <div className="mt-2 grid gap-2">
+                      <label className="text-xs text-[var(--muted)]">Selecciona motor de render</label>
+                      <select
+                        value={renderEngine}
+                        onChange={(e) => setRenderEngine(e.target.value === "v2" ? "v2" : "v1")}
+                        className="rounded-lg border border-[var(--line)] bg-white px-3 py-2 text-xs font-medium text-[var(--text)]"
+                      >
+                        <option value="v1">Engine v1 (Estable)</option>
+                        <option value="v2">Engine v2 (Nuevo GPU)</option>
+                      </select>
+                      <div className="text-[11px] text-[var(--muted)]">
+                        {renderEngine === "v2" ? "Usa el renderer paralelo optimizado." : "Usa el renderer actual comprobado."}
+                      </div>
+                    </div>
+                  </div>
                   <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-muted)] p-3">
                     <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-[var(--muted)]">Destino en PC</div>
                     <div className="mt-2 flex flex-wrap items-center gap-2">

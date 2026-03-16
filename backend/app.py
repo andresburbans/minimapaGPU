@@ -41,6 +41,36 @@ except ImportError:
     GPU_RENDER_AVAILABLE = False
     def render_frame_gpu(*args, **kwargs):
         raise NotImplementedError("GPU render not available")
+    def init_gpu(*args, **kwargs):
+        return {"available": False, "backend": "cpu"}
+    def preload_track_gpu(*args, **kwargs):
+        return None
+    def cleanup_gpu(*args, **kwargs):
+        return None
+    _CONTEXT = None
+
+try:
+    from engine_v2 import (
+        ENGINE_V2_AVAILABLE,
+        cleanup_v2,
+        init_engine_v2,
+        preload_track_v2,
+        render_frame_v2,
+    )
+except ImportError:
+    ENGINE_V2_AVAILABLE = False
+
+    def render_frame_v2(*args, **kwargs):
+        raise NotImplementedError("Engine v2 not available")
+
+    def init_engine_v2(*args, **kwargs):
+        return {"available": False, "backend": "none", "using_cuda": False}
+
+    def preload_track_v2(*args, **kwargs):
+        return None
+
+    def cleanup_v2(*args, **kwargs):
+        return None
 
 
 from track import track_points, render_overlay
@@ -180,6 +210,87 @@ async def cleanup_data_endpoint():
     }
 
 
+def _engine_name(cfg: RenderConfig) -> str:
+    return str(getattr(cfg, "engine", "v1") or "v1").lower()
+
+
+def _is_engine_v2(cfg: RenderConfig) -> bool:
+    return _engine_name(cfg) == "v2"
+
+
+def _release_system_resources(job_id: Optional[str] = None, frame_dir: Optional[Path] = None, cooldown_s: float = 0.25) -> None:
+    import gc
+    import time
+
+    cleanup_warnings = []
+    if job_id:
+        _update_job(job_id, log="Liberando recursos del sistema")
+
+    try:
+        import cupy as cp
+
+        try:
+            cp.cuda.Stream.null.synchronize()
+        except Exception:
+            pass
+        try:
+            cp.cuda.runtime.deviceSynchronize()
+        except Exception:
+            pass
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        try:
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    for name, cleanup_fn in (("engine_v2", cleanup_v2), ("gpu_v1", cleanup_gpu)):
+        try:
+            cleanup_fn()
+        except Exception as exc:
+            cleanup_warnings.append(f"{name}: {exc}")
+
+    gc.collect()
+
+    if frame_dir and frame_dir.exists():
+        try:
+            shutil.rmtree(frame_dir, ignore_errors=True)
+        except Exception as exc:
+            cleanup_warnings.append(f"frame_dir: {exc}")
+
+    if cooldown_s > 0:
+        time.sleep(cooldown_s)
+
+    if job_id:
+        if cleanup_warnings:
+            _update_job(job_id, log="Recursos liberados con advertencias: " + "; ".join(cleanup_warnings[:3]))
+        else:
+            _update_job(job_id, log="Recursos liberados")
+
+
 def _dispatch_render(cfg: RenderConfig, dataset: rasterio.io.DatasetReader, vectors: list, center_e: float, center_n: float, heading: float, job_id: Optional[str] = None, frame_idx: Optional[int] = None) -> Image.Image:
     """Helper to dispatch rendering to GPU or CPU with automatic fallback."""
     render_params = {
@@ -201,6 +312,21 @@ def _dispatch_render(cfg: RenderConfig, dataset: rasterio.io.DatasetReader, vect
         "compass_size_px": cfg.compass_size_px,
         "wms_source": cfg.wms_source,
     }
+
+    if _is_engine_v2(cfg):
+        if not ENGINE_V2_AVAILABLE:
+            warn_msg = "[ENGINE_V2] No disponible. Fallback a Engine v1."
+            print(warn_msg)
+            if job_id:
+                _update_job(job_id, log=warn_msg)
+        else:
+            try:
+                return render_frame_v2(**render_params)
+            except Exception as e:
+                warn_msg = f"[ENGINE_V2] Error en {'preview' if frame_idx is None else f'frame {frame_idx}'}: {e}. Fallback a Engine v1."
+                print(warn_msg)
+                if job_id:
+                    _update_job(job_id, log=warn_msg)
 
     if cfg.use_gpu:
         if not GPU_RENDER_AVAILABLE:
@@ -232,6 +358,7 @@ async def preview(req: PreviewRequest):
             # Force CPU for Preview to avoid Preload overhead and locking
             # This is the behavior from the stable rollback checkpoint
             cfg.use_gpu = False
+            cfg.engine = "v1"
             
             vectors = load_vectors(
                 dataset.crs,
@@ -830,97 +957,143 @@ def _format_eta(seconds: float) -> str:
 def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, output_path: Path) -> None:
     import time
     import shutil as shutil_mod
-    
+
+    use_engine_v2 = _is_engine_v2(config)
+    v2_using_cuda = False
+    use_pipe = False
+    ffmpeg_proc = None
+    pinned_cpu_buffer = None
+    pinned_mem = None
+
     try:
         if config.use_gpu:
             import gpu_utils
             gpu_utils.force_cuda_gpu()
-            
-        # If GPU is enabled, we MUST run in a single process/thread to maintain CUDA context
-        if config.use_gpu and GPU_RENDER_AVAILABLE:
+
+        if use_engine_v2 and not ENGINE_V2_AVAILABLE:
+            _update_job(job_id, log='[ENGINE_V2] No disponible. Fallback a engine v1.')
+            use_engine_v2 = False
+            config.engine = 'v1'
+
+        if use_engine_v2:
             workers = 1
-            # Check GPU status
+            v2_stat = init_engine_v2(prefer_gpu=config.use_gpu)
+            v2_using_cuda = bool(v2_stat.get('using_cuda', False) and v2_stat.get('available', False))
+            if (not config.use_gpu) or (not v2_using_cuda):
+                if config.use_gpu and GPU_RENDER_AVAILABLE:
+                    _update_job(job_id, log='[ENGINE_V2] GPU optimizada no disponible. Fallback a engine v1 con GPU.')
+                    use_engine_v2 = False
+                    config.engine = 'v1'
+                    workers = 1
+                    gpu_stat = init_gpu()
+                    if not gpu_stat.get('available', False):
+                        _update_job(job_id, log=f"Advertencia: GPU no disponible ({gpu_stat.get('error')}), usando CPU.")
+                        config.use_gpu = False
+                        workers = config.workers if config.workers > 0 else max(1, (os.cpu_count() or 2) - 1)
+                else:
+                    _update_job(job_id, log='[ENGINE_V2] Requiere GPU activa. Fallback a engine v1.')
+                    use_engine_v2 = False
+                    config.engine = 'v1'
+                    workers = config.workers if config.workers > 0 else max(1, (os.cpu_count() or 2) - 1)
+        elif config.use_gpu and GPU_RENDER_AVAILABLE:
+            workers = 1
             gpu_stat = init_gpu()
-            if not gpu_stat.get("available", False):
+            if not gpu_stat.get('available', False):
                 _update_job(job_id, log=f"Advertencia: GPU no disponible ({gpu_stat.get('error')}), usando CPU.")
-                config.use_gpu = False # Fallback to CPU
-                # Restore worker count if fallback? No, simpler to stick to 1 or let it be.
+                config.use_gpu = False
                 workers = config.workers if config.workers > 0 else max(1, (os.cpu_count() or 2) - 1)
         else:
             workers = config.workers if config.workers > 0 else max(1, (os.cpu_count() or 2) - 1)
 
-        _update_job(job_id, status="rendering", message="Renderizando frames", log="Renderizando frames")
-        
+        _update_job(job_id, status='rendering', message='Renderizando frames', log='Renderizando frames')
+
+        def _preload_v1() -> None:
+            _update_job(job_id, log='Iniciando precarga en GPU...')
+            cleanup_gpu()
+
+            def preload_cb(pct, msg):
+                _update_job(job_id, log=f'Precarga {pct}%: {msg}')
+
+            preload_track_gpu(config, jobs, progress_callback=preload_cb)
+
         if workers <= 1:
-            # OPTIMIZATION: Pre-load whole track area to GPU if available
-            if config.use_gpu and GPU_RENDER_AVAILABLE:
+            if use_engine_v2:
                 try:
-                    from render_gpu import preload_track_gpu
-                    _update_job(job_id, log="Iniciando precarga en GPU...")
-                    # Deep clean first
-                    cleanup_gpu()
-                    def preload_cb(pct, msg):
-                        # Force log update
-                        _update_job(job_id, log=f"Precarga {pct}%: {msg}")
-                    
-                    preload_track_gpu(config, jobs, progress_callback=preload_cb) 
+                    _update_job(job_id, log='Iniciando precarga Engine v2...')
+                    cleanup_v2()
+
+                    def preload_v2_cb(pct, msg):
+                        _update_job(job_id, log=f'V2 {pct}%: {msg}')
+
+                    preload_track_v2(config, jobs, progress_callback=preload_v2_cb)
                 except Exception as e:
-                    err_msg = f"[GPU] Error crítico en precarga: {e}. El proceso se detiene por seguridad."
-                    _update_job(job_id, status="failed", message=err_msg, log=err_msg)
+                    warn_msg = f'[ENGINE_V2] Precarga fallo: {e}. Fallback a engine v1.'
+                    _update_job(job_id, log=warn_msg)
+                    cleanup_v2()
+                    use_engine_v2 = False
+                    config.engine = 'v1'
+                    if config.use_gpu and GPU_RENDER_AVAILABLE:
+                        _preload_v1()
+            elif config.use_gpu and GPU_RENDER_AVAILABLE:
+                try:
+                    _preload_v1()
+                except Exception as e:
+                    err_msg = f'[GPU] Error critico en precarga: {e}. El proceso se detiene por seguridad.'
+                    _update_job(job_id, status='failed', message=err_msg, log=err_msg)
                     raise RuntimeError(err_msg)
-            
-            # Reset timer after preload to avoid skewing ETA
+
             start_time = time.time()
-        
+
         start_time = time.time()
         total_frames = len(jobs)
 
-        use_pipe = config.use_gpu and GPU_RENDER_AVAILABLE
-        ffmpeg_proc = None
+        use_pipe = (config.use_gpu and v2_using_cuda) if use_engine_v2 else (config.use_gpu and GPU_RENDER_AVAILABLE)
         if use_pipe:
-            _update_job(job_id, log="Modo Pipeline GPU Directo activado")
+            pipe_mode = 'Engine v2' if use_engine_v2 else 'GPU directo'
+            _update_job(job_id, log=f'Modo Pipeline {pipe_mode} activado')
             nvenc = _nvenc_available()
-            codec = "h264_nvenc" if nvenc else "libx264"
-            preset = "p5" if nvenc else "fast"
-            if nvenc: _update_job(job_id, log="Usando Aceleración de Hardware NVENC")
+            codec = 'h264_nvenc' if nvenc else 'libx264'
+            preset = 'p5' if nvenc else 'fast'
+            if nvenc:
+                _update_job(job_id, log='Usando Aceleracion de Hardware NVENC')
             try:
-                cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo", "-s", f"{config.width}x{config.height}", "-pix_fmt", "rgba", "-r", str(config.fps), "-i", "-", "-c:v", codec, "-preset", preset, "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_path)]
-                ffmpeg_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=20*1024*1024)
+                cmd = [
+                    'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+                    '-s', f'{config.width}x{config.height}', '-pix_fmt', 'rgba',
+                    '-r', str(config.fps), '-i', '-', '-c:v', codec, '-preset', preset,
+                    '-pix_fmt', 'yuv420p', '-movflags', '+faststart', str(output_path)
+                ]
+                ffmpeg_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=20 * 1024 * 1024)
             except Exception as e:
-                _update_job(job_id, log=f"Error Pipe: {e}. Fallback disco.")
+                _update_job(job_id, log=f'Error Pipe: {e}. Fallback disco.')
                 use_pipe = False
-        
-        # Prepare Pinned Memory for Zero-Copy Transfer
-        pinned_cpu_buffer = None
-        pinned_mem = None
-        if use_pipe and GPU_RENDER_AVAILABLE:
+
+        if use_pipe and (not use_engine_v2) and GPU_RENDER_AVAILABLE:
             try:
                 import cupy as cp
                 import numpy as np
-                # Allocate Pinned Memory (Page-locked)
+
                 alloc_size = config.width * config.height * 4
                 try:
                     pinned_mem = cp.cuda.alloc_pinned_memory(alloc_size)
                 except Exception as e:
-                    if "cudaErrorAlreadyMapped" in str(e) or "cudaErrorMemoryAllocation" in str(e):
-                        _update_job(job_id, log="Limpiando pools de memoria para asignar Pinned Mem...")
+                    if 'cudaErrorAlreadyMapped' in str(e) or 'cudaErrorMemoryAllocation' in str(e):
+                        _update_job(job_id, log='Limpiando pools de memoria para asignar Pinned Mem...')
                         cp.get_default_pinned_memory_pool().free_all_blocks()
                         pinned_mem = cp.cuda.alloc_pinned_memory(alloc_size)
-                    else: raise e
-                
-                # Create Numpy array backed by pinned memory (Slice to exact size)
+                    else:
+                        raise e
+
                 pinned_cpu_buffer = np.frombuffer(pinned_mem, np.uint8)[:alloc_size].reshape((config.height, config.width, 4))
                 _update_job(job_id, log="Memoria 'Pinned' activada.")
             except Exception as e:
-                _update_job(job_id, log=f"No Pinned Mem: {e}")
+                _update_job(job_id, log=f'No Pinned Mem: {e}')
                 pinned_cpu_buffer = None
                 pinned_mem = None
 
-        # Frame cache to avoid re-rendering identical frames
         frame_cache = {}
         cache_precision = 4
         cache_hits = 0
-
 
         if workers <= 1:
             with rasterio.open(config.ortho_path) as dataset:
@@ -936,84 +1109,95 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                     config.point_color,
                 )
                 for idx, center_e, center_n, heading, frame_path in jobs:
-                    # Check Cancellation
                     with _JOB_LOCK:
-                        if _JOBS.get(job_id, {}).get("cancel_requested"):
-                            _update_job(job_id, status="cancelled", message="Cancelado por usuario", log="🛑 Cancelado.")
-                            raise InterruptedError("Cancelled")
+                        if _JOBS.get(job_id, {}).get('cancel_requested'):
+                            _update_job(job_id, status='cancelled', message='Cancelado por usuario', log='Cancelado.')
+                            raise InterruptedError('Cancelled')
 
-                    # Create cache key
                     cache_key = (round(center_e, cache_precision), round(center_n, cache_precision), round(heading, 1))
-                    
+
                     if not use_pipe and cache_key in frame_cache:
                         shutil_mod.copy2(frame_cache[cache_key], frame_path)
                         cache_hits += 1
                     else:
-                        # Use a safe overscan for clipping vectors to avoid truncation during rotation
-                        clip_margin = config.map_half_width_m * 2.0
-                        bbox = (
-                            center_e - clip_margin,
-                            center_n - clip_margin,
-                            center_e + clip_margin,
-                            center_n + clip_margin,
-                        )
-                        clipped = clip_vectors(vectors, bbox)
-                        # Dispatch rendering (handles GPU/CPU switch and fallback)
+                        if use_engine_v2 or (config.use_gpu and GPU_RENDER_AVAILABLE):
+                            clipped = vectors
+                        else:
+                            clip_margin = config.map_half_width_m * 2.0
+                            bbox = (
+                                center_e - clip_margin,
+                                center_n - clip_margin,
+                                center_e + clip_margin,
+                                center_n + clip_margin,
+                            )
+                            clipped = clip_vectors(vectors, bbox)
+
                         frame = _dispatch_render(config, dataset, clipped, center_e, center_n, heading, job_id=job_id, frame_idx=idx)
 
-                        if idx == 0 and hasattr(frame, 'max'):
-                             try:
-                                 m = frame.max()
-                                 if hasattr(m, 'item'): m = m.item()
-                                 _update_job(job_id, log=f"[DEBUG] GPU Frame 0 Max: {m}")
-                             except: pass
+                        if (not use_engine_v2) and idx == 0 and hasattr(frame, 'max'):
+                            try:
+                                m = frame.max()
+                                if hasattr(m, 'item'):
+                                    m = m.item()
+                                _update_job(job_id, log=f'[DEBUG] GPU Frame 0 Max: {m}')
+                            except Exception:
+                                pass
 
-                        # Handle Output (Pinned mem or Standard)
                         to_write = None
-                        if use_pipe and pinned_cpu_buffer is not None and hasattr(frame, 'get'):
-                            frame.get(out=pinned_cpu_buffer)
-                            # Direct write from buffer (No Copy)
-                            to_write = pinned_cpu_buffer
-                        elif use_pipe:
-                             if hasattr(frame, 'tobytes'): to_write = frame.tobytes()
-                             elif hasattr(frame, 'get'): to_write = frame.get().tobytes()
+                        if use_pipe:
+                            if (not use_engine_v2) and pinned_cpu_buffer is not None and hasattr(frame, 'get'):
+                                frame.get(out=pinned_cpu_buffer)
+                                to_write = pinned_cpu_buffer
+                            elif (not use_engine_v2) and hasattr(frame, 'tobytes'):
+                                to_write = frame.tobytes()
+                            elif (not use_engine_v2) and hasattr(frame, 'get'):
+                                to_write = frame.get().tobytes()
+                            elif use_engine_v2 and hasattr(frame, 'detach'):
+                                frame_cpu = frame.detach()
+                                if hasattr(frame_cpu, 'is_cuda') and frame_cpu.is_cuda:
+                                    frame_cpu = frame_cpu.to('cpu')
+                                to_write = frame_cpu.contiguous().numpy().tobytes()
+                            elif hasattr(frame, 'tobytes'):
+                                to_write = frame.tobytes()
 
                         if use_pipe and ffmpeg_proc and to_write is not None:
                             try:
                                 ffmpeg_proc.stdin.write(to_write)
                             except Exception as e:
-                                raise RuntimeError(f"FFmpeg Pipe Error: {e}")
+                                raise RuntimeError(f'FFmpeg Pipe Error: {e}')
                         else:
-                            # Disk fallback
                             if hasattr(frame, 'get'):
-                                frame = Image.fromarray(frame.get(), "RGBA")
+                                frame = Image.fromarray(frame.get(), 'RGBA')
                                 if config.show_compass:
                                     c_pos = (config.width - config.compass_size_px - 10, config.compass_size_px + 10)
                                     from render import _draw_compass
                                     _draw_compass(frame, c_pos, config.compass_size_px, -heading)
-                            frame.save(frame_path, "PNG")
+                            elif use_engine_v2 and hasattr(frame, 'detach'):
+                                frame_cpu = frame.detach()
+                                if hasattr(frame_cpu, 'is_cuda') and frame_cpu.is_cuda:
+                                    frame_cpu = frame_cpu.to('cpu')
+                                frame = Image.fromarray(frame_cpu.contiguous().numpy(), 'RGBA')
+                            frame.save(frame_path, 'PNG')
                             frame_cache[cache_key] = frame_path
-                    
-                    # Calculate ETA
-                    # Calculate ETA
+
                     elapsed = time.time() - start_time
                     frames_done = idx + 1
-                    
+
                     if frames_done > 0 and elapsed > 0:
                         fps_rate = frames_done / elapsed
                         remaining = total_frames - frames_done
                         eta_str = _format_eta(remaining / fps_rate if fps_rate > 0 else 0)
                         pct = int((frames_done / total_frames) * 100)
-                        msg = f"{pct}% • Frame {frames_done}/{total_frames} • {fps_rate:.1f} FPS • ETA {eta_str}"
+                        msg = f'{pct}% - Frame {frames_done}/{total_frames} - {fps_rate:.1f} FPS - ETA {eta_str}'
                     else:
-                        msg = f"Iniciando... Frame {frames_done}/{total_frames}"
+                        msg = f'Iniciando... Frame {frames_done}/{total_frames}'
                     _update_job(job_id, progress=frames_done, message=msg)
-            
+
             if use_pipe and ffmpeg_proc:
                 ffmpeg_proc.stdin.close()
                 ffmpeg_proc.wait()
         else:
-            ctx = get_context("spawn")
+            ctx = get_context('spawn')
             total = len(jobs)
             with ctx.Pool(
                 processes=workers,
@@ -1045,12 +1229,11 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                 for _ in pool.imap_unordered(
                     render_frame_job, jobs, chunksize=max(1, total // (workers * 4))
                 ):
-                    # Check Cancellation in CPU Loop
                     with _JOB_LOCK:
-                         if _JOBS.get(job_id, {}).get("cancel_requested"):
-                             pool.terminate()
-                             _update_job(job_id, status="cancelled", message="Cancelado por usuario", log="🛑 Cancelado.")
-                             raise InterruptedError("Cancelled")
+                        if _JOBS.get(job_id, {}).get('cancel_requested'):
+                            pool.terminate()
+                            _update_job(job_id, status='cancelled', message='Cancelado por usuario', log='Cancelado.')
+                            raise InterruptedError('Cancelled')
 
                     done += 1
                     elapsed = time.time() - start_time
@@ -1058,48 +1241,45 @@ def _render_task(job_id: str, config: RenderConfig, jobs, frame_dir: Path, outpu
                         fps_rate = done / elapsed
                         remaining = total - done
                         eta_str = _format_eta(remaining / fps_rate if fps_rate > 0 else 0)
-                        msg = f"Frame {done}/{total} • ETA: {eta_str}"
+                        msg = f'Frame {done}/{total} - ETA: {eta_str}'
                     else:
-                        msg = f"Frame {done}/{total}"
+                        msg = f'Frame {done}/{total}'
                     _update_job(job_id, progress=done, message=msg)
 
         if cache_hits > 0:
             cache_pct = (cache_hits / total_frames) * 100
-            _update_job(job_id, log=f"Cache: {cache_hits} frames reutilizados ({cache_pct:.1f}%)")
-        
+            _update_job(job_id, log=f'Cache: {cache_hits} frames reutilizados ({cache_pct:.1f}%)')
+
         if not use_pipe:
-            _update_job(job_id, status="encoding", message="Codificando video", log="Codificando video")
+            _update_job(job_id, status='encoding', message='Codificando video', log='Codificando video')
             _encode_video(frame_dir, output_path, config.fps, config.use_gpu)
-        
+
         total_time = time.time() - start_time
-        _update_job(job_id, status="finished", progress=len(jobs), message=f"Finalizado en {_format_eta(total_time)}", log=f"Tiempo total: {_format_eta(total_time)}")
+        _update_job(job_id, status='finished', progress=len(jobs), message=f'Finalizado en {_format_eta(total_time)}', log=f'Tiempo total: {_format_eta(total_time)}')
     except InterruptedError:
-        # Status already set to cancelled inside loop
-        if use_pipe and ffmpeg_proc:
-             try:
-                 ffmpeg_proc.stdin.close()
-                 ffmpeg_proc.wait()
-             except: pass
-        pass
-    except Exception as exc:
-        _update_job(job_id, status="error", message="Error en render", log=str(exc), error=str(exc))
-    finally:
-        # Cleanup Pinned Memory References
-        pinned_cpu_buffer = None
-        pinned_mem = None
-        # Ensure FFmpeg is closed
         if use_pipe and ffmpeg_proc:
             try:
-                if ffmpeg_proc.stdin: ffmpeg_proc.stdin.close()
+                ffmpeg_proc.stdin.close()
+                ffmpeg_proc.wait()
+            except Exception:
+                pass
+        pass
+    except Exception as exc:
+        _update_job(job_id, status='error', message='Error en render', log=str(exc), error=str(exc))
+    finally:
+        pinned_cpu_buffer = None
+        pinned_mem = None
+        if use_pipe and ffmpeg_proc:
+            try:
+                if ffmpeg_proc.stdin:
+                    ffmpeg_proc.stdin.close()
                 ffmpeg_proc.wait(timeout=5)
-            except: 
-                try: ffmpeg_proc.kill()
-                except: pass
-        if GPU_RENDER_AVAILABLE:
-            cleanup_gpu()
-        import gc
-        gc.collect()
-
+            except Exception:
+                try:
+                    ffmpeg_proc.kill()
+                except Exception:
+                    pass
+        _release_system_resources(job_id=job_id, frame_dir=frame_dir)
 
 def _track_task(job_id: str, req: TrackRequest, output_path: Path) -> None:
     try:
@@ -1123,6 +1303,8 @@ def _track_task(job_id: str, req: TrackRequest, output_path: Path) -> None:
         )
     except Exception as exc:
         _update_job(job_id, status="error", message="Error en tracking", log=str(exc), error=str(exc))
+    finally:
+        _release_system_resources(job_id=job_id)
 
 
 def _render_overlay_task(job_id: str, req: OverlayRequest, output_path: Path) -> None:
@@ -1149,6 +1331,8 @@ def _render_overlay_task(job_id: str, req: OverlayRequest, output_path: Path) ->
         _update_job(job_id, status="finished", message="Overlay finalizado", log="Overlay finalizado")
     except Exception as exc:
         _update_job(job_id, status="error", message="Error en overlay", log=str(exc), error=str(exc))
+    finally:
+        _release_system_resources(job_id=job_id)
 
 
 def _try_encode(cmd: List[str]) -> bool:
